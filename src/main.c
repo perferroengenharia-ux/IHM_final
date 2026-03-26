@@ -1,209 +1,1803 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
+#include "freertos/queue.h"
+#include "freertos/portmacro.h"
+
 #include "driver/gpio.h"
-#include "esp_timer.h"
+#include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_err.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "esp_system.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
-/* ====================================================================
- * 1. CONFIGURAÇÃO DE HARDWARE (SEM CONFLITOS)
- * ==================================================================== */
+static const char *TAG = "IHM_AXON";
 
-// --- Display 7 Segmentos (Pinos Originais Mantidos) ---
-const int segment_pins[] = {13, 15, 14, 27, 26, 25, 33}; // A, B, C, D, E, F, G
-#define SEG_DP      32
-const int digit_pins[] = {23, 22, 21}; // DIG1, DIG2, DIG3
+/* ============================================================
+ * HARDWARE FIXO PEDIDO PELO USUÁRIO
+ * - Pinos do display mantidos
+ * - Pinos da comunicação mantidos
+ * - Botões físicos apenas comentados para referência
+ * ============================================================ */
 
-// --- Comunicação RS485 (Pinos Originais Mantidos) ---
-#define UART_RS485      UART_NUM_2
-#define RS485_TX_PIN    17
-#define RS485_RX_PIN    16
-#define RS485_EN_PIN    4
+/* -------- Display 7 segmentos (cátodo comum) -------- */
+#define SEG_A               GPIO_NUM_13
+#define SEG_B               GPIO_NUM_15
+#define SEG_C               GPIO_NUM_14
+#define SEG_D               GPIO_NUM_27
+#define SEG_E               GPIO_NUM_26
+#define SEG_F               GPIO_NUM_25
+#define SEG_G               GPIO_NUM_33
+#define SEG_DP              GPIO_NUM_32
 
-// --- LEDs de Status (Novos Pinos para evitar conflito com 13, 15 e 4) ---
-static const gpio_num_t LED_PINS[] = {GPIO_NUM_18, GPIO_NUM_19, GPIO_NUM_5, GPIO_NUM_2, GPIO_NUM_12};
-#define LED_ON  0
-#define LED_OFF 1
+#define DIGIT_1             GPIO_NUM_23
+#define DIGIT_2             GPIO_NUM_22
+#define DIGIT_3             GPIO_NUM_21
 
-// --- Simulação UART (Console) ---
-#define UART_CONSOLE    UART_NUM_0
+/* -------- Comunicação RS485 com MI -------- */
+#define RS485_UART          UART_NUM_2
+#define RS485_TX_PIN        GPIO_NUM_17
+#define RS485_RX_PIN        GPIO_NUM_16
+#define RS485_EN_PIN        GPIO_NUM_4
+#define RS485_BAUD          115200
 
-/* ====================================================================
- * 2. ESTRUTURAS E ESTADOS
- * ==================================================================== */
-typedef enum { STATE_READY, STATE_RUN, STATE_ERROR } system_state_t;
+/* -------- LEDs remapeados --------
+ * Os pinos 21/22/23 do código de periféricos conflitam com os dígitos do display.
+ * Por isso os LEDs foram realocados.
+ * Observação: GPIO0 é pino de strap; mantenha-o em nível alto no boot.
+ */
+#define LED_ACTIVE_ON       0
+#define LED_ACTIVE_OFF      1
+#define LED_SWING_PIN       GPIO_NUM_18
+#define LED_DRENO_PIN       GPIO_NUM_19
+#define LED_CLIMA_PIN       GPIO_NUM_2
+#define LED_VENT_PIN        GPIO_NUM_5
+#define LED_EXAUSTAO_PIN    GPIO_NUM_0
+
+/* -------- Botões físicos (somente referência, NÃO usados) --------
+static const gpio_num_t BTN_PINS[] = {
+    GPIO_NUM_32, GPIO_NUM_33, GPIO_NUM_25, GPIO_NUM_26, GPIO_NUM_27,
+    GPIO_NUM_14, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_4, GPIO_NUM_5
+};
+*/
+
+#define TOTAL_DIGITS            3
+#define MULTIPLEX_INTERVAL_US   4000
+#define BLINK_INTERVAL_MS       400
+#define BUTTON_PULSE_MS         250
+#define CONSOLE_BUF_SZ          128
+
+#define HEARTBEAT_EXPECT_MS     500
+#define STATUS_TIMEOUT_MS       3000
+#define COMM_FAULT_HOLD_MS      3000
+#define WD_CHECK_MS             100
+#define COMM_STABLE_CLEAR_MS    600
+#define COMM_STARTUP_GRACE_MS   4000
+
+#define FAULT_HOLD_MS           200
+#define FAULT_CLEAR_HOLD_MS     600
+
+#define DC_OV_THRESHOLD         410
+#define DC_UV_THRESHOLD         180
+#define IGBT_OT_THRESHOLD       90
+
+#define MAX_PAYLOAD             128
+#define MAX_FRAME_RAW           (1 + 4 + MAX_PAYLOAD + 2)
+#define MAX_FRAME_ESC           (MAX_FRAME_RAW * 2)
+#define SOF                     0x7E
+#define ESC                     0x7D
+#define ESC_XOR                 0x20
+#define ADDR_STM32              0x01
+#define TYPE_READ_STATUS        0x04
+#define TYPE_WRITE_PARAM        0x05
+
+#define BTN_BIT_START           (1u << 0)
+#define BTN_BIT_STOP            (1u << 1)
+#define BTN_BIT_UP              (1u << 2)
+#define BTN_BIT_DOWN            (1u << 3)
+
+#define AUX_BIT_BOMBA           (1u << 0)
+#define AUX_BIT_SWING           (1u << 1)
+#define AUX_BIT_EXAUSTAO        (1u << 2)
+#define AUX_BIT_DRENO           (1u << 3)
+#define AUX_BIT_SYSTEM_ON       (1u << 4)
+
+#define E02_DC_OV               2
+#define E03_DC_UV               3
+#define E04_IGBT_OT             4
+#define E05_OVL                 5
+#define E07_LINE_UV             7
+#define E08_COMM                8
+
+/* ============================================================
+ * ESTADOS E ESTRUTURAS
+ * ============================================================ */
+
+typedef enum {
+    BTN_MAIS = 0,
+    BTN_MENOS,
+    BTN_CLIMATIZAR,
+    BTN_VENTILAR,
+    BTN_DRENO,
+    BTN_SWING,
+    BTN_EXAUSTAO,
+    BTN_ONOFF,
+    BTN_SET,
+    BTN_RESET_WIFI
+} button_id_t;
+
+typedef enum {
+    DRENO_IDLE = 0,
+    DRENO_AGUARDANDO_LED,
+    DRENO_EM_CURSO
+} dreno_state_t;
+
+typedef enum {
+    STATE_READY = 0,
+    STATE_RUN,
+    STATE_MENU_SEL,
+    STATE_MENU_EDIT,
+    STATE_ERROR
+} system_state_t;
 
 typedef struct {
-    uint8_t  buttons;      // Bit 0: Start, Bit 1: Stop
-    uint16_t target_freq;  // x100 (Ex: 6000 = 60.00Hz)
-    uint8_t  direction;    // 0: FWD, 1: REV
-} ihm_control_t;
+    int id;
+    int value;
+    int def_val;
+    int min_val;
+    int max_val;
+    bool read_only;
+    bool pending_sync;
+} parameter_t;
 
 typedef struct {
-    uint16_t current_freq;
-    uint16_t current_amp;
-    uint8_t  temp;
+    uint8_t addr, type, seq, len;
+    uint8_t payload[MAX_PAYLOAD];
+} frame_t;
+
+typedef enum {
+    PS_WAIT_SOF = 0,
+    PS_HDR_ADDR,
+    PS_HDR_TYPE,
+    PS_HDR_SEQ,
+    PS_HDR_LEN,
+    PS_PAYLOAD,
+    PS_CRC_L,
+    PS_CRC_H
+} parse_state_t;
+
+typedef struct {
+    parse_state_t st;
+    bool esc_next;
+    uint8_t addr, type, seq, len;
+    uint8_t payload[MAX_PAYLOAD];
+    uint8_t pay_i, crc_l, crc_h;
+} frame_parser_t;
+
+typedef struct {
+    uint16_t current_freq_centi_hz;
+    uint16_t v_bus;
+    uint16_t i_out;
+    uint16_t v_out;
+    uint8_t temp_igbt;
 } mi_telemetry_t;
 
-// Globais
-static ihm_control_t g_ctrl = {0, 3000, 0};
-static mi_telemetry_t g_tel = {0};
-static system_state_t g_state = STATE_READY;
-volatile uint8_t display_buffer[3] = {0, 0, 0};
-static bool comm_fail = false;
+enum {
+    IDX_P00 = 0,
+    IDX_P01,
+    IDX_P02,
+    IDX_P03,
+    IDX_P04,
+    IDX_P05,
+    IDX_P06,
+    IDX_P10,
+    IDX_P11,
+    IDX_P12,
+    IDX_P20,
+    IDX_P21,
+    IDX_P30,
+    IDX_P31,
+    IDX_P32,
+    IDX_P33,
+    IDX_P35,
+    IDX_P42,
+    IDX_P43,
+    IDX_P44,
+    IDX_P45,
+    IDX_P51,
+    IDX_P80,
+    IDX_P81,
+    IDX_P82,
+    IDX_P83,
+    IDX_P84,
+    IDX_P85,
+    IDX_P86,
+    IDX_P90,
+    IDX_P91,
+    PARAM_COUNT
+};
 
-const uint8_t segment_map[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+static parameter_t params[PARAM_COUNT] = {
+    { 0,   0,   0,   0, 999, false, false},
+    { 1,   0,   0,   0,  90, true,  false},
+    { 2, 310, 310,   0, 410, true,  false},
+    { 3,   0,   0,   0,  20, true,  false},
+    { 4,   0,   0,   0, 410, true,  false},
+    { 5,  45,  45,   0, 100, true,  false},
+    { 6,   0,   0,   0,  99, true,  false},
+    {10,  10,  10,   5,  60, false, false},
+    {11,  10,  10,   5,  60, false, false},
+    {12,   0,   0,   0,   1, false, false},
+    {20,   1,   1,   1,  24, false, false},
+    {21,  60,  60,  23,  90, false, false},
+    {30,  10,  10,   0, 240, false, false},
+    {31,   5,   5,   0, 240, false, false},
+    {32,  30,  30,   0,  90, false, false},
+    {33,   0,   0,   0,   1, false, false},
+    {35,   0,   0,   0,   9, false, false},
+    {42,   5,   5,   5,  15, false, false},
+    {43,   5,   5,   1,   9, false, false},
+    {44,   0,   0,   0,   1, false, false},
+    {45, 180, 180, 100, 200, false, false},
+    {51,   0,   0,   0,   1, false, false},
+    {80,   0,   0,   0,   2, false, false},
+    {81,   0,   0,   0,   1, false, false},
+    {82,   0,   0,   0,   2, false, false},
+    {83,  10,  10,   1, 240, false, false},
+    {84,   5,   5,   1, 240, false, false},
+    {85,   1,   1,   0,   2, false, false},
+    {86,   0,   0,   0, 240, false, false},
+    {90,   0,   0,   0, 100, true,  false},
+    {91,   5,   5,   0,  40, false, false}
+};
 
-/* ====================================================================
- * 3. TASK DE SIMULAÇÃO VIA UART (SUBSTITUI BTNS FÍSICOS)
- * ==================================================================== */
-static void uart_console_task(void *arg) {
-    uint8_t data[64];
-    while (1) {
-        int len = uart_read_bytes(UART_CONSOLE, data, sizeof(data) - 1, pdMS_TO_TICKS(50));
-        if (len > 0) {
-            data[len] = '\0';
-            char *cmd = (char *)data;
+static const gpio_num_t segment_pins[7] = {
+    SEG_A, SEG_B, SEG_C, SEG_D, SEG_E, SEG_F, SEG_G
+};
+static const gpio_num_t digit_pins[TOTAL_DIGITS] = {
+    DIGIT_1, DIGIT_2, DIGIT_3
+};
+static const gpio_num_t led_pins[5] = {
+    LED_SWING_PIN, LED_DRENO_PIN, LED_CLIMA_PIN, LED_VENT_PIN, LED_EXAUSTAO_PIN
+};
 
-            if (strstr(cmd, "START")) {
-                g_ctrl.buttons |= 0x01;
-                g_ctrl.buttons &= ~0x02;
-                printf("[Simulação] Comando: START\n");
-            } 
-            else if (strstr(cmd, "STOP")) {
-                g_ctrl.buttons |= 0x02;
-                g_ctrl.buttons &= ~0x01;
-                printf("[Simulação] Comando: STOP\n");
-            }
-            else if (strstr(cmd, "UP")) {
-                if (g_ctrl.target_freq < 6000) g_ctrl.target_freq += 200;
-                printf("[Simulação] Freq Alvo: %d\n", g_ctrl.target_freq);
-            }
-            else if (strstr(cmd, "DOWN")) {
-                if (g_ctrl.target_freq > 0) g_ctrl.target_freq -= 200;
-                printf("[Simulação] Freq Alvo: %d\n", g_ctrl.target_freq);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(100));
+static portMUX_TYPE meas_mux = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE status_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static QueueHandle_t g_frame_q = NULL;
+static frame_parser_t g_parser;
+
+static system_state_t current_state = STATE_READY;
+static dreno_state_t dreno_status = DRENO_IDLE;
+
+static bool system_on = false;
+static bool motor_running = false;
+static bool is_locked = true;
+static bool bomba_on = false;
+static bool swing_on = false;
+static bool exaustao_on = false;
+static bool saved_bomba_on = false;
+static bool wifi_lost = false;
+static bool water_shortage = false;
+static bool g_show_logs = false;
+static bool sim_enabled = false;
+static bool sim_ws = false;
+static bool sim_wl = false;
+
+static int current_param_idx = IDX_P00;
+static int current_error_code = 0;
+static int temp_edit_value = 0;
+static int saved_frequency = 1;
+static int target_frequency = 1;            /* Hz */
+static int target_before_error = 0;
+static bool motor_was_running_before_error = false;
+static float output_frequency = 0.0f;       /* Hz */
+
+static bool blink_visible = true;
+static bool dp_blink_visible = true;
+static uint8_t display_buffer[3] = {0, 0, 0};
+
+#define ERR_HIST_SIZE 5
+static uint8_t err_hist[ERR_HIST_SIZE] = {0};
+static uint8_t err_head = 0;
+static uint8_t err_count = 0;
+static int err_view_offset = 0;
+
+static nvs_handle_t g_nvs = 0;
+static const char *NVS_NS = "ihm";
+
+static mi_telemetry_t g_telemetry = {0};
+static volatile int64_t last_status_rx_us = 0;
+static volatile uint32_t status_rx_packets = 0;
+static volatile bool comm_good_recent = false;
+
+static uint8_t g_button_pulse_mask = 0;
+static int64_t g_button_pulse_until_us = 0;
+static uint8_t g_direction = 0; /* 0=FWD, 1=REV */
+
+/* ============================================================
+ * UTILITÁRIOS
+ * ============================================================ */
+
+static int clamp_i(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static bool is_mi_synced_index(int idx) {
+    switch (idx) {
+        case IDX_P10:
+        case IDX_P11:
+        case IDX_P20:
+        case IDX_P21:
+        case IDX_P35:
+        case IDX_P42:
+        case IDX_P43:
+        case IDX_P44:
+        case IDX_P45:
+        case IDX_P85:
+            return true;
+        default:
+            return false;
     }
 }
 
-/* ====================================================================
- * 4. CONTROLE DO DISPLAY (MULTIPLEXAÇÃO)
- * ==================================================================== */
-static void IRAM_ATTR multiplex_timer_callback(void* arg) {
-    static uint8_t digit = 0;
-    for(int i=0; i<3; i++) gpio_set_level(digit_pins[i], 1); // Desliga dígitos
-
-    uint8_t segs = display_buffer[digit];
-    for(int i=0; i<7; i++) gpio_set_level(segment_pins[i], (segs >> i) & 0x01);
-    gpio_set_level(SEG_DP, (segs >> 7) & 0x01);
-
-    gpio_set_level(digit_pins[digit], 0); // Liga dígito atual
-    digit = (digit + 1) % 3;
+static void mark_param_pending_if_synced_to_mi(int idx) {
+    if (idx >= 0 && idx < PARAM_COUNT && is_mi_synced_index(idx)) {
+        params[idx].pending_sync = true;
+    }
 }
 
-void update_display_logic() {
-    if (comm_fail) {
-        display_buffer[0] = 0x79; // E
-        display_buffer[1] = 0x3F; // 0
-        display_buffer[2] = 0x7F; // 8
+static void pulse_buttons(uint8_t bits) {
+    g_button_pulse_mask |= bits;
+    g_button_pulse_until_us = esp_timer_get_time() + ((int64_t)BUTTON_PULSE_MS * 1000LL);
+}
+
+static uint8_t consume_button_mask_for_tx(void) {
+    if (g_button_pulse_mask == 0) {
+        return 0;
+    }
+
+    if (esp_timer_get_time() > g_button_pulse_until_us) {
+        g_button_pulse_mask = 0;
+        return 0;
+    }
+
+    return g_button_pulse_mask;
+}
+
+static void maybe_clear_button_pulse_after_tx(void) {
+    if (esp_timer_get_time() > g_button_pulse_until_us) {
+        g_button_pulse_mask = 0;
+    }
+}
+
+static uint8_t get_aux_flags(void) {
+    uint8_t f = 0;
+    if (bomba_on)      f |= AUX_BIT_BOMBA;
+    if (swing_on)      f |= AUX_BIT_SWING;
+    if (exaustao_on)   f |= AUX_BIT_EXAUSTAO;
+    if (dreno_status != DRENO_IDLE) f |= AUX_BIT_DRENO;
+    if (system_on)     f |= AUX_BIT_SYSTEM_ON;
+    return f;
+}
+
+static int telemetry_current_ma_to_display_a(uint16_t current_ma) {
+    return (int)((current_ma + 500U) / 1000U);
+}
+
+static bool telemetry_overload_trip(uint16_t current_ma) {
+    int threshold_a = clamp_i(params[IDX_P43].value, params[IDX_P43].min_val, params[IDX_P43].max_val);
+    uint32_t threshold_ma = (uint32_t)threshold_a * 1000U;
+    return (uint32_t)current_ma > threshold_ma;
+}
+
+static uint8_t get_char_pattern(char c) {
+    switch (toupper((unsigned char)c)) {
+        case '0': return 0b00111111;
+        case '1': return 0b00000110;
+        case '2': return 0b01011011;
+        case '3': return 0b01001111;
+        case '4': return 0b01100110;
+        case '5': return 0b01101101;
+        case '6': return 0b01111101;
+        case '7': return 0b00000111;
+        case '8': return 0b01111111;
+        case '9': return 0b01101111;
+        case 'P': return 0b01110011;
+        case 'E': return 0b01111001;
+        case 'R': return 0b01010000;
+        case 'D': return 0b01011110;
+        case 'Y': return 0b01101110;
+        case ' ': return 0b00000000;
+        default:  return 0b00000000;
+    }
+}
+
+static uint8_t err_hist_get_by_offset(int offset_from_newest) {
+    if (err_count == 0) return 0;
+    if (offset_from_newest < 0) offset_from_newest = 0;
+    if (offset_from_newest >= err_count) offset_from_newest = err_count - 1;
+
+    int idx = (int)err_head - 1 - offset_from_newest;
+    while (idx < 0) idx += ERR_HIST_SIZE;
+    return err_hist[idx % ERR_HIST_SIZE];
+}
+
+static void trim_spaces(char *s) {
+    if (!s) return;
+    while (*s && isspace((unsigned char)*s)) {
+        memmove(s, s + 1, strlen(s));
+    }
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) {
+        s[--n] = '\0';
+    }
+}
+
+/* ============================================================
+ * NVS / PARÂMETROS
+ * ============================================================ */
+
+static void enforce_param_coherence(void) {
+    int fmin = clamp_i(params[IDX_P20].value, params[IDX_P20].min_val, params[IDX_P20].max_val);
+    int fmax = clamp_i(params[IDX_P21].value, params[IDX_P21].min_val, params[IDX_P21].max_val);
+
+    if (fmin >= fmax) {
+        fmin = fmax - 1;
+        if (fmin < params[IDX_P20].min_val) {
+            fmin = params[IDX_P20].min_val;
+        }
+    }
+
+    params[IDX_P20].value = fmin;
+    params[IDX_P21].value = fmax;
+
+    params[IDX_P32].value = clamp_i(params[IDX_P32].value, params[IDX_P32].min_val, params[IDX_P21].value);
+    params[IDX_P12].value = clamp_i(params[IDX_P12].value, params[IDX_P12].min_val, params[IDX_P12].max_val);
+    params[IDX_P91].value = clamp_i(params[IDX_P91].value, 0, 40);
+    params[IDX_P90].value = clamp_i(params[IDX_P90].value, 0, 100);
+
+    saved_frequency = clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
+    target_frequency = clamp_i(target_frequency, params[IDX_P20].value, params[IDX_P21].value);
+}
+
+static void nvs_save_param_by_index(int idx) {
+    if (!g_nvs || idx < 0 || idx >= PARAM_COUNT || params[idx].read_only) {
+        return;
+    }
+    char key[8];
+    snprintf(key, sizeof(key), "P%02d", params[idx].id);
+    nvs_set_i32(g_nvs, key, (int32_t)params[idx].value);
+    nvs_commit(g_nvs);
+}
+
+static void nvs_save_saved_frequency(void) {
+    if (!g_nvs) return;
+    nvs_set_i32(g_nvs, "saveF", (int32_t)saved_frequency);
+    nvs_commit(g_nvs);
+}
+
+static void nvs_save_lock(void) {
+    if (!g_nvs) return;
+    nvs_set_u8(g_nvs, "locked", (uint8_t)(is_locked ? 1 : 0));
+    nvs_commit(g_nvs);
+}
+
+static void nvs_save_error_history(void) {
+    if (!g_nvs) return;
+    nvs_set_blob(g_nvs, "err5", err_hist, sizeof(err_hist));
+    nvs_set_u8(g_nvs, "eh", err_head);
+    nvs_set_u8(g_nvs, "ec", err_count);
+    nvs_commit(g_nvs);
+}
+
+static void nvs_init_and_open(void) {
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+    ESP_ERROR_CHECK(nvs_open(NVS_NS, NVS_READWRITE, &g_nvs));
+}
+
+static void nvs_load_all(void) {
+    if (!g_nvs) return;
+
+    for (int i = 0; i < PARAM_COUNT; i++) {
+        if (params[i].read_only) continue;
+        char key[8];
+        snprintf(key, sizeof(key), "P%02d", params[i].id);
+        int32_t v = 0;
+        if (nvs_get_i32(g_nvs, key, &v) == ESP_OK) {
+            params[i].value = (int)v;
+        }
+    }
+
+    int32_t sf = 0;
+    if (nvs_get_i32(g_nvs, "saveF", &sf) == ESP_OK) {
+        saved_frequency = (int)sf;
+    }
+
+    uint8_t lk = 1;
+    if (nvs_get_u8(g_nvs, "locked", &lk) == ESP_OK) {
+        is_locked = (lk != 0);
+    }
+
+    size_t sz = sizeof(err_hist);
+    if (nvs_get_blob(g_nvs, "err5", err_hist, &sz) != ESP_OK || sz != sizeof(err_hist)) {
+        memset(err_hist, 0, sizeof(err_hist));
+        err_head = 0;
+        err_count = 0;
+    } else {
+        uint8_t eh = 0;
+        uint8_t ec = 0;
+        if (nvs_get_u8(g_nvs, "eh", &eh) == ESP_OK) err_head = eh % ERR_HIST_SIZE;
+        if (nvs_get_u8(g_nvs, "ec", &ec) == ESP_OK) err_count = (ec > ERR_HIST_SIZE) ? ERR_HIST_SIZE : ec;
+    }
+
+    enforce_param_coherence();
+    err_view_offset = 0;
+    params[IDX_P06].value = (int)err_hist_get_by_offset(0);
+}
+
+static void error_history_push(uint8_t code) {
+    err_hist[err_head] = code;
+    err_head = (err_head + 1) % ERR_HIST_SIZE;
+    if (err_count < ERR_HIST_SIZE) err_count++;
+    err_view_offset = 0;
+    params[IDX_P06].value = (int)err_hist_get_by_offset(0);
+    nvs_save_error_history();
+}
+
+/* ============================================================
+ * DISPLAY E LEDs
+ * ============================================================ */
+
+static void update_leds(void) {
+    if (!system_on) {
+        for (int i = 0; i < 5; i++) {
+            gpio_set_level(led_pins[i], LED_ACTIVE_OFF);
+        }
         return;
     }
 
-    if (g_state == STATE_READY) {
-        display_buffer[0] = 0x50; // r
-        display_buffer[1] = 0x5E; // d
-        display_buffer[2] = 0x6E; // y
-    } else {
-        uint16_t val = g_tel.current_freq / 10;
-        display_buffer[0] = segment_map[(val/100)%10];
-        display_buffer[1] = segment_map[(val/10)%10] | 0x80; // Ponto decimal
-        display_buffer[2] = segment_map[val%10];
+    if (dreno_status != DRENO_IDLE) {
+        gpio_set_level(LED_SWING_PIN,    LED_ACTIVE_OFF);
+        gpio_set_level(LED_DRENO_PIN,    LED_ACTIVE_ON);
+        gpio_set_level(LED_CLIMA_PIN,    LED_ACTIVE_OFF);
+        gpio_set_level(LED_VENT_PIN,     LED_ACTIVE_OFF);
+        gpio_set_level(LED_EXAUSTAO_PIN, LED_ACTIVE_OFF);
+        return;
+    }
+
+    gpio_set_level(LED_SWING_PIN,    swing_on ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
+    gpio_set_level(LED_DRENO_PIN,    LED_ACTIVE_OFF);
+    gpio_set_level(LED_CLIMA_PIN,    (bomba_on && !exaustao_on) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
+    gpio_set_level(LED_VENT_PIN,     (!bomba_on && !exaustao_on) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
+    gpio_set_level(LED_EXAUSTAO_PIN, exaustao_on ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
+}
+
+static void update_display_logic(void) {
+    int val = 0;
+
+    switch (current_state) {
+        case STATE_READY:
+            display_buffer[0] = get_char_pattern('R');
+            display_buffer[1] = get_char_pattern('D');
+            display_buffer[2] = get_char_pattern('Y');
+            return;
+
+        case STATE_RUN:
+            val = (int)output_frequency;
+            break;
+
+        case STATE_MENU_SEL:
+            display_buffer[0] = get_char_pattern('P');
+            display_buffer[1] = get_char_pattern((params[current_param_idx].id / 10) % 10 + '0');
+            display_buffer[2] = get_char_pattern(params[current_param_idx].id % 10 + '0');
+            return;
+
+        case STATE_MENU_EDIT: {
+            int p_id = params[current_param_idx].id;
+            if (p_id == 6) {
+                int e = (int)err_hist_get_by_offset(err_view_offset);
+                display_buffer[0] = get_char_pattern('E');
+                display_buffer[1] = get_char_pattern((e / 10) % 10 + '0');
+                display_buffer[2] = get_char_pattern(e % 10 + '0');
+                return;
+            }
+            val = temp_edit_value;
+        } break;
+
+        case STATE_ERROR:
+            display_buffer[0] = get_char_pattern('E');
+            display_buffer[1] = get_char_pattern((current_error_code / 10) % 10 + '0');
+            display_buffer[2] = get_char_pattern(current_error_code % 10 + '0');
+            return;
+    }
+
+    display_buffer[0] = (val >= 100) ? get_char_pattern((val / 100) % 10 + '0') : get_char_pattern(' ');
+    display_buffer[1] = (val >= 10)  ? get_char_pattern((val / 10) % 10 + '0') : get_char_pattern(' ');
+    display_buffer[2] = get_char_pattern(val % 10 + '0');
+
+    if (val == 0) {
+        display_buffer[0] = get_char_pattern(' ');
+        display_buffer[1] = get_char_pattern(' ');
+        display_buffer[2] = get_char_pattern('0');
     }
 }
 
-/* ====================================================================
- * 5. COMUNICAÇÃO RS485 (CORE 1)
- * ==================================================================== */
-static void ihm_sync_task(void *arg) {
-    uint8_t dummy_rx[16];
-    while (1) {
-        // Simulação de Frame: Envia Controle, Recebe Telemetria
-        gpio_set_level(RS485_EN_PIN, 1);
-        uart_write_bytes(UART_RS485, &g_ctrl, sizeof(ihm_control_t));
-        uart_wait_tx_done(UART_RS485, pdMS_TO_TICKS(10));
-        gpio_set_level(RS485_EN_PIN, 0);
+static void multiplex_timer_callback(void *arg) {
+    (void)arg;
+    static int current_pos = 0;
+    static uint32_t blink_ticks = 0;
+    static uint32_t dp_ticks = 0;
 
-        int rx_len = uart_read_bytes(UART_RS485, dummy_rx, sizeof(dummy_rx), pdMS_TO_TICKS(100));
-        
-        if (rx_len > 0) {
-            comm_fail = false;
-            // Atualiza g_tel com dados reais vindos do STM32 aqui
-            g_state = (g_ctrl.buttons & 0x01) ? STATE_RUN : STATE_READY;
+    blink_ticks++;
+    if (blink_ticks >= (BLINK_INTERVAL_MS * 1000 / MULTIPLEX_INTERVAL_US)) {
+        blink_visible = !blink_visible;
+        blink_ticks = 0;
+    }
+
+    dp_ticks++;
+    if (dp_ticks >= (250000 / MULTIPLEX_INTERVAL_US)) {
+        dp_blink_visible = !dp_blink_visible;
+        dp_ticks = 0;
+    }
+
+    for (int i = 0; i < TOTAL_DIGITS; i++) {
+        gpio_set_level(digit_pins[i], 0);
+    }
+
+    bool should_hide = false;
+    if (current_state == STATE_ERROR && !blink_visible) {
+        should_hide = true;
+    }
+
+    if (current_state == STATE_MENU_EDIT && !blink_visible) {
+        int p_id = params[current_param_idx].id;
+        bool motor_active = (motor_running || output_frequency > 0.1f);
+        bool can_actually_edit = true;
+
+        if (p_id == 6 || params[current_param_idx].read_only) {
+            can_actually_edit = false;
+        } else if (is_locked && p_id != 0) {
+            can_actually_edit = false;
+        } else if (motor_active &&
+                   (p_id == 10 || p_id == 11 || p_id == 20 || p_id == 21 ||
+                    p_id == 32 || p_id == 35 || p_id == 42 || p_id == 43 ||
+                    p_id == 45 || p_id == 51)) {
+            can_actually_edit = false;
+        }
+
+        if (can_actually_edit) {
+            should_hide = true;
+        }
+    }
+
+    if (!should_hide) {
+        uint8_t pattern = display_buffer[current_pos];
+        for (int i = 0; i < 7; i++) {
+            gpio_set_level(segment_pins[i], (pattern >> i) & 0x01);
+        }
+
+        bool dp_state =
+            (current_pos == 0 && water_shortage && dp_blink_visible) ||
+            (current_pos == 2 && wifi_lost      && dp_blink_visible);
+        gpio_set_level(SEG_DP, dp_state ? 1 : 0);
+
+        gpio_set_level(digit_pins[current_pos], 1);
+    }
+
+    current_pos = (current_pos + 1) % TOTAL_DIGITS;
+}
+
+/* ============================================================
+ * ERROS
+ * ============================================================ */
+
+static void enter_error(int code) {
+    if (current_state == STATE_ERROR && current_error_code != E08_COMM) {
+        return;
+    }
+
+    if (current_state != STATE_ERROR) {
+        motor_was_running_before_error = motor_running;
+        target_before_error = target_frequency;
+    }
+
+    current_error_code = code;
+    params[IDX_P06].value = code;
+    error_history_push((uint8_t)code);
+
+    current_state = STATE_ERROR;
+    motor_running = false;
+    update_display_logic();
+    update_leds();
+}
+
+static void clear_error_auto(void) {
+    current_error_code = 0;
+
+    if (params[IDX_P44].value == 1 && motor_was_running_before_error) {
+        motor_running = true;
+        system_on = true;
+        current_state = STATE_RUN;
+        target_frequency = clamp_i(target_before_error, params[IDX_P20].value, params[IDX_P21].value);
+        pulse_buttons(BTN_BIT_START);
+    } else {
+        motor_running = false;
+        if (!system_on) {
+            current_state = STATE_READY;
         } else {
-            comm_fail = true; 
+            current_state = STATE_READY;
+        }
+    }
+
+    update_display_logic();
+    update_leds();
+}
+
+/* ============================================================
+ * RS485 / PROTOCOLO
+ * ============================================================ */
+
+static uint16_t crc16_ibm(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+static void parser_reset(frame_parser_t *p) {
+    p->st = PS_WAIT_SOF;
+    p->esc_next = false;
+    p->pay_i = 0;
+}
+
+static bool parser_feed(frame_parser_t *p, uint8_t byte, frame_t *out_frame) {
+    if (byte == SOF) {
+        parser_reset(p);
+        p->st = PS_HDR_ADDR;
+        return false;
+    }
+    if (p->st == PS_WAIT_SOF) {
+        return false;
+    }
+    if (p->esc_next) {
+        byte ^= ESC_XOR;
+        p->esc_next = false;
+    } else if (byte == ESC) {
+        p->esc_next = true;
+        return false;
+    }
+
+    switch (p->st) {
+        case PS_HDR_ADDR:
+            p->addr = byte;
+            p->st = PS_HDR_TYPE;
+            break;
+        case PS_HDR_TYPE:
+            p->type = byte;
+            p->st = PS_HDR_SEQ;
+            break;
+        case PS_HDR_SEQ:
+            p->seq = byte;
+            p->st = PS_HDR_LEN;
+            break;
+        case PS_HDR_LEN:
+            if (byte > MAX_PAYLOAD) {
+                parser_reset(p);
+                return false;
+            }
+            p->len = byte;
+            p->st = (p->len == 0) ? PS_CRC_L : PS_PAYLOAD;
+            break;
+        case PS_PAYLOAD:
+            p->payload[p->pay_i++] = byte;
+            if (p->pay_i >= p->len) {
+                p->st = PS_CRC_L;
+            }
+            break;
+        case PS_CRC_L:
+            p->crc_l = byte;
+            p->st = PS_CRC_H;
+            break;
+        case PS_CRC_H: {
+            p->crc_h = byte;
+            uint8_t tmp[4 + MAX_PAYLOAD];
+            tmp[0] = p->addr;
+            tmp[1] = p->type;
+            tmp[2] = p->seq;
+            tmp[3] = p->len;
+            if (p->len) memcpy(&tmp[4], p->payload, p->len);
+            uint16_t calc = crc16_ibm(tmp, 4 + p->len);
+            uint16_t recv = (uint16_t)p->crc_l | ((uint16_t)p->crc_h << 8);
+            if (calc == recv) {
+                out_frame->addr = p->addr;
+                out_frame->type = p->type;
+                out_frame->seq = p->seq;
+                out_frame->len = p->len;
+                if (p->len) memcpy(out_frame->payload, p->payload, p->len);
+                parser_reset(p);
+                return true;
+            }
+            parser_reset(p);
+        } break;
+        default:
+            parser_reset(p);
+            break;
+    }
+
+    return false;
+}
+
+static size_t build_frame(uint8_t addr, uint8_t type, uint8_t seq,
+                          const uint8_t *payload, uint8_t len,
+                          uint8_t *out_esc, size_t out_max) {
+    uint8_t raw[MAX_FRAME_RAW];
+    size_t r_idx = 0;
+
+    (void)out_max;
+    raw[r_idx++] = SOF;
+    raw[r_idx++] = addr;
+    raw[r_idx++] = type;
+    raw[r_idx++] = seq;
+    raw[r_idx++] = len;
+    if (len && payload) {
+        memcpy(&raw[r_idx], payload, len);
+        r_idx += len;
+    }
+
+    uint16_t crc = crc16_ibm(&raw[1], r_idx - 1);
+    raw[r_idx++] = (uint8_t)(crc & 0xFF);
+    raw[r_idx++] = (uint8_t)((crc >> 8) & 0xFF);
+
+    size_t e_idx = 0;
+    out_esc[e_idx++] = SOF;
+    for (size_t i = 1; i < r_idx; i++) {
+        if (raw[i] == SOF || raw[i] == ESC) {
+            out_esc[e_idx++] = ESC;
+            out_esc[e_idx++] = raw[i] ^ ESC_XOR;
+        } else {
+            out_esc[e_idx++] = raw[i];
+        }
+    }
+
+    return e_idx;
+}
+
+static inline void rs485_set_tx(bool en) {
+    gpio_set_level(RS485_EN_PIN, en ? 1 : 0);
+}
+
+static void status_touch(void) {
+    portENTER_CRITICAL(&status_mux);
+    last_status_rx_us = esp_timer_get_time();
+    status_rx_packets++;
+    comm_good_recent = true;
+    portEXIT_CRITICAL(&status_mux);
+}
+
+static bool rs485_request(uint8_t type, const uint8_t *payload, uint8_t len,
+                          frame_t *reply, uint32_t timeout_ms) {
+    static uint8_t seq = 0;
+    seq++;
+
+    uint8_t txbuf[MAX_FRAME_ESC];
+    size_t txlen = build_frame(ADDR_STM32, type, seq, payload, len, txbuf, sizeof(txbuf));
+
+    frame_t dump;
+    while (xQueueReceive(g_frame_q, &dump, 0) == pdTRUE) {
+        /* flush */
+    }
+
+    rs485_set_tx(true);
+    esp_rom_delay_us(50);
+    uart_write_bytes(RS485_UART, (const char *)txbuf, txlen);
+    uart_wait_tx_done(RS485_UART, pdMS_TO_TICKS(100));
+    rs485_set_tx(false);
+
+    frame_t fr;
+    if (xQueueReceive(g_frame_q, &fr, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+        if (fr.seq == seq) {
+            if (reply) *reply = fr;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool sync_params_to_mi(bool force_all) {
+    uint8_t tx_payload[3];
+    frame_t rep;
+
+    for (int i = 0; i < PARAM_COUNT; i++) {
+        if (!is_mi_synced_index(i)) continue;
+        if (!(force_all || params[i].pending_sync)) continue;
+
+        tx_payload[0] = (uint8_t)params[i].id;
+        tx_payload[1] = (uint8_t)((uint16_t)params[i].value >> 8);
+        tx_payload[2] = (uint8_t)((uint16_t)params[i].value & 0xFF);
+
+        if (!rs485_request(TYPE_WRITE_PARAM, tx_payload, 3, &rep, 200)) {
+            return false;
+        }
+
+        params[i].pending_sync = false;
+        ESP_LOGI(TAG, "Sync MI: P%02d=%d", params[i].id, params[i].value);
+    }
+
+    return true;
+}
+
+static void init_rs485_uart(void) {
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << RS485_EN_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
+    rs485_set_tx(false);
+
+    uart_config_t cfg = {
+        .baud_rate = RS485_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_EVEN,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(RS485_UART, 1024, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(RS485_UART, &cfg));
+    ESP_ERROR_CHECK(uart_set_pin(RS485_UART, RS485_TX_PIN, RS485_RX_PIN,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+}
+
+/* ============================================================
+ * TAREFAS
+ * ============================================================ */
+
+static void rs485_rx_task(void *arg) {
+    (void)arg;
+    uint8_t buf[128];
+    parser_reset(&g_parser);
+
+    while (1) {
+        int n = uart_read_bytes(RS485_UART, buf, sizeof(buf), pdMS_TO_TICKS(10));
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                frame_t fr;
+                if (parser_feed(&g_parser, buf[i], &fr)) {
+                    if (g_frame_q) {
+                        xQueueSend(g_frame_q, &fr, 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void sim_task(void *arg) {
+    (void)arg;
+    int sim_dc = 311;
+    int sim_tmp = 32;
+    int sim_line = 220;
+
+    while (1) {
+        if (sim_enabled) {
+            status_touch();
+            water_shortage = sim_ws;
+            wifi_lost = sim_wl;
+
+            if (motor_running && system_on && dreno_status == DRENO_IDLE) {
+                if (output_frequency < (float)target_frequency) output_frequency += 1.0f;
+                else if (output_frequency > (float)target_frequency) output_frequency -= 1.0f;
+            } else {
+                if (output_frequency > 0.0f) output_frequency -= 2.0f;
+                if (output_frequency < 0.0f) output_frequency = 0.0f;
+            }
+
+            portENTER_CRITICAL(&meas_mux);
+            g_telemetry.current_freq_centi_hz = (uint16_t)(output_frequency * 100.0f);
+            g_telemetry.i_out = (uint16_t)((output_frequency * 100.0f) + 200.0f);
+            g_telemetry.v_bus = (uint16_t)sim_dc;
+            g_telemetry.v_out = (uint16_t)((output_frequency * 220.0f) / 60.0f);
+            g_telemetry.temp_igbt = (uint8_t)sim_tmp;
+            params[IDX_P02].value = sim_dc;
+            params[IDX_P03].value = clamp_i(telemetry_current_ma_to_display_a(g_telemetry.i_out), 0, params[IDX_P03].max_val);
+            params[IDX_P04].value = g_telemetry.v_out;
+            params[IDX_P05].value = sim_tmp;
+            portEXIT_CRITICAL(&meas_mux);
+
+            params[IDX_P01].value = (int)output_frequency;
+            update_display_logic();
+            update_leds();
+        }
+
+        (void)sim_line;
+        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_EXPECT_MS));
+    }
+}
+
+static void ihm_sync_task(void *arg) {
+    (void)arg;
+    frame_t rep;
+    uint8_t tx_payload[9];
+
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    if (!sim_enabled) {
+        ESP_LOGI(TAG, "Iniciando handshake MI...");
+        while (!sync_params_to_mi(true)) {
+            ESP_LOGW(TAG, "Falha no handshake, tentando novamente...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        ESP_LOGI(TAG, "Handshake MI concluído.");
+    }
+
+    while (1) {
+        if (sim_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        tx_payload[0] = consume_button_mask_for_tx();
+        tx_payload[1] = (uint8_t)(((uint16_t)(target_frequency * 100)) >> 8);
+        tx_payload[2] = (uint8_t)(((uint16_t)(target_frequency * 100)) & 0xFF);
+        tx_payload[3] = g_direction;
+        tx_payload[4] = get_aux_flags();
+        tx_payload[5] = (uint8_t)dreno_status;
+        tx_payload[6] = (uint8_t)params[IDX_P90].value;
+        tx_payload[7] = (uint8_t)params[IDX_P91].value;
+        tx_payload[8] = (uint8_t)(current_state == STATE_ERROR && current_error_code == E08_COMM);
+
+        if (g_show_logs) {
+            ESP_LOGI(TAG, "TX BTN=0x%02X FREQ=%d DIR=%u AUX=0x%02X DRENO=%d",
+                     tx_payload[0], target_frequency * 100, g_direction, tx_payload[4], dreno_status);
+        }
+
+        if (rs485_request(TYPE_READ_STATUS, tx_payload, 9, &rep, 120)) {
+            status_touch();
+            maybe_clear_button_pulse_after_tx();
+
+            if (rep.len >= 9) {
+                portENTER_CRITICAL(&meas_mux);
+                g_telemetry.current_freq_centi_hz = (uint16_t)((rep.payload[0] << 8) | rep.payload[1]);
+                g_telemetry.i_out = (uint16_t)((rep.payload[2] << 8) | rep.payload[3]);
+                g_telemetry.v_bus = (uint16_t)((rep.payload[4] << 8) | rep.payload[5]);
+                g_telemetry.v_out = (uint16_t)((rep.payload[6] << 8) | rep.payload[7]);
+                g_telemetry.temp_igbt = rep.payload[8];
+                portEXIT_CRITICAL(&meas_mux);
+
+                output_frequency = ((float)g_telemetry.current_freq_centi_hz) / 100.0f;
+                params[IDX_P01].value = (int)output_frequency;
+                params[IDX_P02].value = g_telemetry.v_bus;
+                params[IDX_P03].value = clamp_i(telemetry_current_ma_to_display_a(g_telemetry.i_out), 0, params[IDX_P03].max_val);
+                params[IDX_P04].value = g_telemetry.v_out;
+                params[IDX_P05].value = g_telemetry.temp_igbt;
+
+                if (g_show_logs) {
+                    ESP_LOGI(TAG, "RX Freq=%.2fHz I=%umA Vbus=%u Vout=%u Temp=%u",
+                             output_frequency, g_telemetry.i_out, g_telemetry.v_bus,
+                             g_telemetry.v_out, g_telemetry.temp_igbt);
+                }
+
+                bool needs_sync = false;
+                for (int i = 0; i < PARAM_COUNT; i++) {
+                    if (params[i].pending_sync) {
+                        needs_sync = true;
+                        break;
+                    }
+                }
+                if (needs_sync && g_telemetry.current_freq_centi_hz == 0) {
+                    ESP_LOGI(TAG, "Motor parado. Sincronizando pendências...");
+                    sync_params_to_mi(false);
+                }
+            }
+        } else if (g_show_logs) {
+            ESP_LOGW(TAG, "Timeout MI");
         }
 
         update_display_logic();
-        
-        // Atualiza LEDs
-        gpio_set_level(LED_PINS[0], (g_state == STATE_RUN) ? LED_ON : LED_OFF);
-        gpio_set_level(LED_PINS[1], comm_fail ? LED_ON : LED_OFF);
-
-        vTaskDelay(pdMS_TO_TICKS(250));
+        update_leds();
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
-/* ====================================================================
- * 6. CONFIGURAÇÃO INICIAL
- * ==================================================================== */
+static void status_watchdog_task(void *arg) {
+    (void)arg;
+    const int64_t hb_us = (int64_t)HEARTBEAT_EXPECT_MS * 1000LL;
+    int64_t expected_acc_us = 0;
+    int64_t last_loop_us = esp_timer_get_time();
+    int64_t boot_us = last_loop_us;
+    uint32_t last_rx_total = 0;
+    float loss_ema = 0.0f;
+    const float alpha = 0.20f;
+    int fault_hold_ms = 0;
+    int stable_ms = 0;
+
+    while (1) {
+        if (sim_enabled) {
+            params[IDX_P90].value = 0;
+            vTaskDelay(pdMS_TO_TICKS(WD_CHECK_MS));
+            continue;
+        }
+
+        int64_t now = esp_timer_get_time();
+        int64_t dt = now - last_loop_us;
+        last_loop_us = now;
+        bool in_grace = ((now - boot_us) < (int64_t)COMM_STARTUP_GRACE_MS * 1000LL);
+
+        expected_acc_us += dt;
+        uint32_t expected_pkts = 0;
+        while (expected_acc_us >= hb_us) {
+            expected_pkts++;
+            expected_acc_us -= hb_us;
+        }
+
+        int64_t last_rx_us_local;
+        uint32_t rx_total;
+        bool good_pulse;
+        portENTER_CRITICAL(&status_mux);
+        last_rx_us_local = last_status_rx_us;
+        rx_total = status_rx_packets;
+        good_pulse = comm_good_recent;
+        comm_good_recent = false;
+        portEXIT_CRITICAL(&status_mux);
+
+        uint32_t rx_delta = rx_total - last_rx_total;
+        last_rx_total = rx_total;
+
+        bool timed_out = (last_rx_us_local == 0) || ((now - last_rx_us_local) > (int64_t)STATUS_TIMEOUT_MS * 1000LL);
+
+        float inst_loss = loss_ema;
+        if (expected_pkts > 0) {
+            float r = (float)rx_delta / (float)expected_pkts;
+            if (r > 1.0f) r = 1.0f;
+            if (r < 0.0f) r = 0.0f;
+            inst_loss = 1.0f - r;
+        }
+
+        if (good_pulse && !timed_out) {
+            loss_ema *= 0.5f;
+        }
+        loss_ema = (1.0f - alpha) * loss_ema + alpha * inst_loss;
+
+        params[IDX_P90].value = clamp_i((int)(loss_ema * 100.0f + 0.5f), 0, 100);
+
+        bool comm_bad = timed_out || (params[IDX_P90].value > params[IDX_P91].value);
+
+        if (in_grace) {
+            fault_hold_ms = 0;
+            stable_ms = 0;
+        } else {
+            if (comm_bad) {
+                fault_hold_ms += WD_CHECK_MS;
+                stable_ms = 0;
+            } else {
+                fault_hold_ms = 0;
+                stable_ms += WD_CHECK_MS;
+            }
+
+            if (fault_hold_ms >= COMM_FAULT_HOLD_MS) {
+                if (!(current_state == STATE_ERROR && current_error_code != E08_COMM)) {
+                    enter_error(E08_COMM);
+                }
+            }
+
+            if (current_state == STATE_ERROR && current_error_code == E08_COMM) {
+                if (stable_ms >= COMM_STABLE_CLEAR_MS) {
+                    clear_error_auto();
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(WD_CHECK_MS));
+    }
+}
+
+static void mi_fault_task(void *arg) {
+    (void)arg;
+    int hold_e02 = 0, hold_e03 = 0, hold_e04 = 0, hold_e05 = 0, hold_e07 = 0;
+    int clr_e02 = 0,  clr_e03 = 0,  clr_e04 = 0,  clr_e05 = 0,  clr_e07 = 0;
+    int mi_line_voltage_local = 220;
+
+    while (1) {
+        int dc, tmp, cur_a, line, outv;
+        uint16_t cur_ma;
+        portENTER_CRITICAL(&meas_mux);
+        dc   = g_telemetry.v_bus;
+        tmp  = g_telemetry.temp_igbt;
+        cur_ma = g_telemetry.i_out;
+        cur_a = telemetry_current_ma_to_display_a(cur_ma);
+        outv = g_telemetry.v_out;
+        line = mi_line_voltage_local;
+        portEXIT_CRITICAL(&meas_mux);
+
+        params[IDX_P02].value = clamp_i(dc,  params[IDX_P02].min_val, params[IDX_P02].max_val);
+        params[IDX_P03].value = clamp_i(cur_a, params[IDX_P03].min_val, params[IDX_P03].max_val);
+        params[IDX_P04].value = clamp_i(outv, params[IDX_P04].min_val, params[IDX_P04].max_val);
+        params[IDX_P05].value = clamp_i(tmp, params[IDX_P05].min_val, params[IDX_P05].max_val);
+
+        bool allow_override = (current_state != STATE_ERROR) || (current_error_code == E08_COMM);
+
+        bool e02 = (dc > DC_OV_THRESHOLD);
+        hold_e02 = e02 ? (hold_e02 + WD_CHECK_MS) : 0;
+        if (allow_override && hold_e02 >= FAULT_HOLD_MS) enter_error(E02_DC_OV);
+        if (current_state == STATE_ERROR && current_error_code == E02_DC_OV) {
+            clr_e02 = (!e02) ? (clr_e02 + WD_CHECK_MS) : 0;
+            if (clr_e02 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+        } else clr_e02 = 0;
+
+        bool e03 = (dc > 0 && dc < DC_UV_THRESHOLD);
+        hold_e03 = e03 ? (hold_e03 + WD_CHECK_MS) : 0;
+        if (allow_override && hold_e03 >= FAULT_HOLD_MS) enter_error(E03_DC_UV);
+        if (current_state == STATE_ERROR && current_error_code == E03_DC_UV) {
+            clr_e03 = (!e03) ? (clr_e03 + WD_CHECK_MS) : 0;
+            if (clr_e03 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+        } else clr_e03 = 0;
+
+        bool e04 = (tmp > IGBT_OT_THRESHOLD);
+        hold_e04 = e04 ? (hold_e04 + WD_CHECK_MS) : 0;
+        if (allow_override && hold_e04 >= FAULT_HOLD_MS) enter_error(E04_IGBT_OT);
+        if (current_state == STATE_ERROR && current_error_code == E04_IGBT_OT) {
+            clr_e04 = (!e04) ? (clr_e04 + WD_CHECK_MS) : 0;
+            if (clr_e04 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+        } else clr_e04 = 0;
+
+        bool e05 = telemetry_overload_trip(cur_ma);
+        hold_e05 = e05 ? (hold_e05 + WD_CHECK_MS) : 0;
+        if (allow_override && hold_e05 >= FAULT_HOLD_MS) enter_error(E05_OVL);
+        if (current_state == STATE_ERROR && current_error_code == E05_OVL) {
+            clr_e05 = (!e05) ? (clr_e05 + WD_CHECK_MS) : 0;
+            if (clr_e05 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+        } else clr_e05 = 0;
+
+        bool e07 = (line > 0 && line < params[IDX_P45].value);
+        hold_e07 = e07 ? (hold_e07 + WD_CHECK_MS) : 0;
+        if (allow_override && hold_e07 >= FAULT_HOLD_MS) enter_error(E07_LINE_UV);
+        if (current_state == STATE_ERROR && current_error_code == E07_LINE_UV) {
+            clr_e07 = (!e07) ? (clr_e07 + WD_CHECK_MS) : 0;
+            if (clr_e07 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+        } else clr_e07 = 0;
+
+        update_display_logic();
+        vTaskDelay(pdMS_TO_TICKS(WD_CHECK_MS));
+    }
+}
+
+/* ============================================================
+ * LÓGICA DE IHM / BOTÕES SIMULADOS
+ * ============================================================ */
+
+static void apply_menu_back(void) {
+    if (current_state == STATE_ERROR) return;
+
+    if (current_state == STATE_MENU_EDIT) {
+        if (params[current_param_idx].id == 0) params[IDX_P00].value = 0;
+        current_state = STATE_MENU_SEL;
+    } else if (current_state == STATE_MENU_SEL) {
+        current_state = (motor_running || output_frequency > 0.1f) ? STATE_RUN : STATE_READY;
+    } else {
+        current_param_idx = IDX_P00;
+        current_state = STATE_MENU_SEL;
+    }
+}
+
+static void apply_menu_enter_or_confirm(void) {
+    if (current_state == STATE_ERROR) return;
+
+    if (current_state == STATE_MENU_SEL) {
+        if (params[current_param_idx].id == 6) err_view_offset = 0;
+        temp_edit_value = params[current_param_idx].value;
+        current_state = STATE_MENU_EDIT;
+        return;
+    }
+
+    if (current_state == STATE_MENU_EDIT) {
+        int p_id = params[current_param_idx].id;
+        bool motor_active = (motor_running || output_frequency > 0.1f);
+
+        if (p_id == 6) {
+            current_state = STATE_MENU_SEL;
+            return;
+        }
+
+        if (p_id == 0) {
+            if (temp_edit_value == 7) {
+                is_locked = !is_locked;
+                nvs_save_lock();
+            } else if (temp_edit_value == 101 && !motor_active) {
+                for (int i = 0; i < PARAM_COUNT; i++) {
+                    if (!params[i].read_only) {
+                        params[i].value = params[i].def_val;
+                    }
+                }
+                saved_frequency = params[IDX_P20].value;
+                target_frequency = params[IDX_P20].value;
+                is_locked = true;
+                enforce_param_coherence();
+                for (int i = 0; i < PARAM_COUNT; i++) {
+                    if (!params[i].read_only) nvs_save_param_by_index(i);
+                }
+                nvs_save_saved_frequency();
+                nvs_save_lock();
+            }
+            params[IDX_P00].value = 0;
+        } else if (!is_locked && !params[current_param_idx].read_only) {
+            bool blocked = motor_active &&
+                           (p_id == 10 || p_id == 11 || p_id == 20 || p_id == 21 ||
+                            p_id == 32 || p_id == 35 || p_id == 42 || p_id == 43 ||
+                            p_id == 45 || p_id == 51);
+            if (!blocked) {
+                int max_limit = (p_id == 32) ? params[IDX_P21].value : params[current_param_idx].max_val;
+                if (temp_edit_value >= params[current_param_idx].min_val && temp_edit_value <= max_limit) {
+                    if (!(p_id == 20 && temp_edit_value >= params[IDX_P21].value) &&
+                        !(p_id == 21 && temp_edit_value <= params[IDX_P20].value)) {
+                        params[current_param_idx].value = temp_edit_value;
+                        enforce_param_coherence();
+                        nvs_save_param_by_index(current_param_idx);
+                        mark_param_pending_if_synced_to_mi(current_param_idx);
+                    }
+                }
+            }
+        }
+
+        current_state = STATE_MENU_SEL;
+        return;
+    }
+
+    current_param_idx = IDX_P00;
+    current_state = STATE_MENU_SEL;
+}
+
+static void change_menu_or_frequency(int dir) {
+    if (current_state == STATE_RUN || current_state == STATE_READY) {
+        if (dir > 0) {
+            if (target_frequency < params[IDX_P21].value) target_frequency++;
+            pulse_buttons(BTN_BIT_UP);
+        } else {
+            if (target_frequency > params[IDX_P20].value) target_frequency--;
+            pulse_buttons(BTN_BIT_DOWN);
+        }
+        if (params[IDX_P12].value == 1) {
+            saved_frequency = target_frequency;
+            nvs_save_saved_frequency();
+        }
+        return;
+    }
+
+    if (current_state == STATE_MENU_SEL) {
+        if (dir > 0) current_param_idx = (current_param_idx + 1) % PARAM_COUNT;
+        else current_param_idx = (current_param_idx - 1 + PARAM_COUNT) % PARAM_COUNT;
+        return;
+    }
+
+    if (current_state == STATE_MENU_EDIT) {
+        int p_id = params[current_param_idx].id;
+        if (p_id == 6) {
+            if (dir > 0) {
+                if (err_count > 0 && err_view_offset < (int)err_count - 1) err_view_offset++;
+            } else {
+                if (err_count > 0 && err_view_offset > 0) err_view_offset--;
+            }
+            return;
+        }
+
+        bool motor_active = (motor_running || output_frequency > 0.1f);
+        bool can_change = true;
+        if (params[current_param_idx].read_only || (is_locked && p_id != 0)) can_change = false;
+        if (motor_active &&
+            (p_id == 10 || p_id == 11 || p_id == 20 || p_id == 21 ||
+             p_id == 32 || p_id == 35 || p_id == 42 || p_id == 43 ||
+             p_id == 45 || p_id == 51)) {
+            can_change = false;
+        }
+
+        if (!can_change) return;
+
+        if (p_id == 42) {
+            if (dir > 0 && temp_edit_value < 15) temp_edit_value += 5;
+            if (dir < 0 && temp_edit_value > 5) temp_edit_value -= 5;
+        } else {
+            int max_limit = (p_id == 32) ? params[IDX_P21].value : params[current_param_idx].max_val;
+            if (dir > 0 && temp_edit_value < max_limit) temp_edit_value++;
+            if (dir < 0 && temp_edit_value > params[current_param_idx].min_val) temp_edit_value--;
+        }
+    }
+}
+
+static void set_motor_running(bool run) {
+    if (run) {
+        system_on = true;
+        motor_running = true;
+        current_state = STATE_RUN;
+        target_frequency = (params[IDX_P12].value == 1) ? saved_frequency : params[IDX_P20].value;
+        pulse_buttons(BTN_BIT_START);
+    } else {
+        motor_running = false;
+        system_on = false;
+        current_state = STATE_READY;
+        if (params[IDX_P12].value == 1) {
+            saved_frequency = target_frequency;
+            nvs_save_saved_frequency();
+        }
+        pulse_buttons(BTN_BIT_STOP);
+    }
+    update_display_logic();
+    update_leds();
+}
+
+static void handle_dreno_led(void) {
+    if (dreno_status == DRENO_AGUARDANDO_LED) {
+        dreno_status = DRENO_EM_CURSO;
+        ESP_LOGW(TAG, "MI confirmou início do dreno.");
+        update_leds();
+    }
+}
+
+static void handle_dreno_end(void) {
+    if (dreno_status == DRENO_EM_CURSO || dreno_status == DRENO_AGUARDANDO_LED) {
+        dreno_status = DRENO_IDLE;
+        bomba_on = false;
+        swing_on = false;
+        exaustao_on = false;
+        set_motor_running(false);
+        ESP_LOGW(TAG, "MI informou fim do dreno.");
+        update_leds();
+    }
+}
+
+static void handle_button_event(button_id_t id, bool long_press) {
+    if (id == BTN_RESET_WIFI) {
+        ESP_LOGW(TAG, "Apagando NVS e reiniciando...");
+        nvs_flash_erase();
+        esp_restart();
+        return;
+    }
+
+    if (id == BTN_SET) {
+        if (long_press) apply_menu_back();
+        else apply_menu_enter_or_confirm();
+        update_display_logic();
+        return;
+    }
+
+    if (id == BTN_MAIS) {
+        change_menu_or_frequency(+1);
+        update_display_logic();
+        return;
+    }
+    if (id == BTN_MENOS) {
+        change_menu_or_frequency(-1);
+        update_display_logic();
+        return;
+    }
+
+    if (id == BTN_ONOFF) {
+        set_motor_running(!motor_running);
+        dreno_status = DRENO_IDLE;
+        if (!motor_running) {
+            bomba_on = false;
+            swing_on = false;
+            exaustao_on = false;
+        }
+        update_leds();
+        return;
+    }
+
+    if (!system_on) {
+        ESP_LOGW(TAG, "Comando ignorado: sistema desligado.");
+        return;
+    }
+
+    if (dreno_status != DRENO_IDLE) {
+        ESP_LOGW(TAG, "Comando bloqueado: dreno ativo.");
+        return;
+    }
+
+    switch (id) {
+        case BTN_CLIMATIZAR:
+            if (exaustao_on) exaustao_on = false;
+            bomba_on = true;
+            break;
+        case BTN_VENTILAR:
+            if (exaustao_on) exaustao_on = false;
+            bomba_on = false;
+            break;
+        case BTN_SWING:
+            swing_on = !swing_on;
+            break;
+        case BTN_EXAUSTAO:
+            if (!exaustao_on) {
+                saved_bomba_on = bomba_on;
+                exaustao_on = true;
+                bomba_on = false;
+            } else {
+                exaustao_on = false;
+                bomba_on = saved_bomba_on;
+            }
+            break;
+        case BTN_DRENO:
+            bomba_on = false;
+            swing_on = false;
+            exaustao_on = false;
+            motor_running = false;
+            current_state = STATE_READY;
+            pulse_buttons(BTN_BIT_STOP);
+            dreno_status = DRENO_AGUARDANDO_LED;
+            ESP_LOGW(TAG, "Ciclo de dreno iniciado. Aguardando confirmação do MI...");
+            break;
+        default:
+            break;
+    }
+
+    update_leds();
+    update_display_logic();
+}
+
+/* ============================================================
+ * CONSOLE / SERIAL MONITOR
+ * ============================================================ */
+
+static void print_help(void) {
+    printf("\n=== COMANDOS IHM ===\n");
+    printf("ONOFF           -> liga/desliga motor\n");
+    printf("MAIS / MENOS    -> ajuste de frequência ou navegação no menu\n");
+    printf("SET             -> entra/edita/confirma menu\n");
+    printf("SETL            -> longo pressionamento do SET (voltar/sair)\n");
+    printf("CLIMA           -> climatizar\n");
+    printf("VENT            -> ventilar\n");
+    printf("SWING           -> toggle swing\n");
+    printf("EXAUSTAO        -> toggle exaustão\n");
+    printf("DRENO           -> inicia dreno\n");
+    printf("DL              -> simula confirmação de início do dreno pelo MI\n");
+    printf("DF              -> simula fim do dreno pelo MI\n");
+    printf("DIR=0|1         -> sentido FWD/REV\n");
+    printf("Pxx=valor       -> escreve parâmetro\n");
+    printf("MON / SIL       -> logs on/off\n");
+    printf("SIM1 / SIM0     -> habilita/desabilita simulador local\n");
+    printf("SIMWS1/0        -> simula falta de água\n");
+    printf("SIMWL1/0        -> simula perda Wi-Fi\n");
+    printf("RESETWIFI       -> apaga NVS e reinicia\n");
+    printf("HELP            -> mostra ajuda\n");
+}
+
+static void process_console_command(char *cmd) {
+    trim_spaces(cmd);
+    if (!cmd || *cmd == '\0') return;
+
+    if (strcasecmp(cmd, "HELP") == 0) {
+        print_help();
+        return;
+    }
+    if (strcasecmp(cmd, "MON") == 0) {
+        g_show_logs = true;
+        printf("\n[LOGS ON]\n");
+        return;
+    }
+    if (strcasecmp(cmd, "SIL") == 0) {
+        g_show_logs = false;
+        printf("\n[LOGS OFF]\n");
+        return;
+    }
+    if (strcasecmp(cmd, "SIM1") == 0) {
+        sim_enabled = true;
+        printf("\n[SIM ON]\n");
+        return;
+    }
+    if (strcasecmp(cmd, "SIM0") == 0) {
+        sim_enabled = false;
+        printf("\n[SIM OFF]\n");
+        return;
+    }
+    if (strcasecmp(cmd, "SIMWS1") == 0) { sim_ws = true;  return; }
+    if (strcasecmp(cmd, "SIMWS0") == 0) { sim_ws = false; return; }
+    if (strcasecmp(cmd, "SIMWL1") == 0) { sim_wl = true;  return; }
+    if (strcasecmp(cmd, "SIMWL0") == 0) { sim_wl = false; return; }
+
+    if (strncasecmp(cmd, "DIR=", 4) == 0) {
+        g_direction = (uint8_t)atoi(cmd + 4);
+        printf("\n[DIR] %s\n", g_direction ? "REV" : "FWD");
+        return;
+    }
+
+    if (strncasecmp(cmd, "P", 1) == 0) {
+        unsigned id = 0;
+        int value = 0;
+        if (sscanf(cmd, "P%u=%d", &id, &value) == 2) {
+            for (int i = 0; i < PARAM_COUNT; i++) {
+                if ((unsigned)params[i].id == id) {
+                    if (params[i].read_only) {
+                        printf("\n[P%02u] somente leitura\n", id);
+                        return;
+                    }
+                    params[i].value = clamp_i(value, params[i].min_val, params[i].max_val);
+                    enforce_param_coherence();
+                    nvs_save_param_by_index(i);
+                    mark_param_pending_if_synced_to_mi(i);
+                    printf("\n[P%02u] = %d\n", id, params[i].value);
+                    update_display_logic();
+                    return;
+                }
+            }
+            printf("\n[P%02u] não encontrado\n", id);
+            return;
+        }
+    }
+
+    if (strcasecmp(cmd, "ONOFF") == 0 || strcasecmp(cmd, "POWER") == 0 || strcasecmp(cmd, "S") == 0) {
+        handle_button_event(BTN_ONOFF, false);
+        return;
+    }
+    if (strcasecmp(cmd, "MAIS") == 0 || strcmp(cmd, "+") == 0) {
+        handle_button_event(BTN_MAIS, false);
+        return;
+    }
+    if (strcasecmp(cmd, "MENOS") == 0 || strcmp(cmd, "-") == 0) {
+        handle_button_event(BTN_MENOS, false);
+        return;
+    }
+    if (strcasecmp(cmd, "SET") == 0 || strcasecmp(cmd, "E") == 0) {
+        handle_button_event(BTN_SET, false);
+        return;
+    }
+    if (strcasecmp(cmd, "SETL") == 0 || strcasecmp(cmd, "M") == 0) {
+        handle_button_event(BTN_SET, true);
+        return;
+    }
+    if (strcasecmp(cmd, "CLIMA") == 0 || strcasecmp(cmd, "CLIMATIZAR") == 0) {
+        handle_button_event(BTN_CLIMATIZAR, false);
+        return;
+    }
+    if (strcasecmp(cmd, "VENT") == 0 || strcasecmp(cmd, "VENTILAR") == 0) {
+        handle_button_event(BTN_VENTILAR, false);
+        return;
+    }
+    if (strcasecmp(cmd, "SWING") == 0) {
+        handle_button_event(BTN_SWING, false);
+        return;
+    }
+    if (strcasecmp(cmd, "EXAUSTAO") == 0 || strcasecmp(cmd, "EX") == 0) {
+        handle_button_event(BTN_EXAUSTAO, false);
+        return;
+    }
+    if (strcasecmp(cmd, "DRENO") == 0) {
+        handle_button_event(BTN_DRENO, false);
+        return;
+    }
+    if (strcasecmp(cmd, "DL") == 0 || strcasecmp(cmd, "DRENO_LED") == 0) {
+        handle_dreno_led();
+        return;
+    }
+    if (strcasecmp(cmd, "DF") == 0 || strcasecmp(cmd, "DRENO_FIM") == 0) {
+        handle_dreno_end();
+        return;
+    }
+    if (strcasecmp(cmd, "RESETWIFI") == 0) {
+        handle_button_event(BTN_RESET_WIFI, false);
+        return;
+    }
+
+    printf("\n[CMD] desconhecido: %s\n", cmd);
+}
+
+static void console_task(void *arg) {
+    (void)arg;
+    char line[CONSOLE_BUF_SZ];
+    int rx_pos = 0;
+    setvbuf(stdin, NULL, _IONBF, 0);
+
+    print_help();
+
+    while (1) {
+        int c = fgetc(stdin);
+        if (c != EOF) {
+            if (c != '\r') {
+                putchar(c);
+                fflush(stdout);
+            }
+
+            if (c == '\n' || c == '\r') {
+                if (rx_pos > 0) {
+                    line[rx_pos] = '\0';
+                    process_console_command(line);
+                    rx_pos = 0;
+                }
+            } else if ((c == 0x08 || c == 0x7F)) {
+                if (rx_pos > 0) rx_pos--;
+            } else if (rx_pos < (int)sizeof(line) - 1) {
+                line[rx_pos++] = (char)c;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* ============================================================
+ * INIT
+ * ============================================================ */
+
 void app_main(void) {
-    nvs_flash_init();
+    uint64_t display_mask = (1ULL << SEG_DP);
+    for (int i = 0; i < 7; i++) display_mask |= (1ULL << segment_pins[i]);
+    for (int i = 0; i < TOTAL_DIGITS; i++) display_mask |= (1ULL << digit_pins[i]);
 
-    // Configuração de Saídas
-    uint64_t out_mask = (1ULL << SEG_DP) | (1ULL << RS485_EN_PIN);
-    for(int i=0; i<7; i++) out_mask |= (1ULL << segment_pins[i]);
-    for(int i=0; i<3; i++) out_mask |= (1ULL << digit_pins[i]);
-    for(int i=0; i<5; i++) out_mask |= (1ULL << LED_PINS[i]);
-
-    gpio_config_t io_conf = {
-        .pin_bit_mask = out_mask,
+    gpio_config_t io_display = {
         .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = display_mask,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
         .intr_type = GPIO_INTR_DISABLE
     };
-    gpio_config(&io_conf);
+    ESP_ERROR_CHECK(gpio_config(&io_display));
 
-    /* // BOTÕES FÍSICOS (COMENTADOS PARA APLICAÇÃO REAL FUTURA)
-    static const gpio_num_t BTN_PINS[] = {GPIO_NUM_34, GPIO_NUM_35, GPIO_NUM_36};
-    uint64_t in_mask = 0;
-    for(int i=0; i<3; i++) in_mask |= (1ULL << BTN_PINS[i]);
-    gpio_config_t in_conf = { .pin_bit_mask = in_mask, .mode = GPIO_MODE_INPUT, .pull_up_en = 1 };
-    gpio_config(&in_conf);
-    */
+    uint64_t leds_mask = 0;
+    for (int i = 0; i < 5; i++) leds_mask |= (1ULL << led_pins[i]);
+    gpio_config_t io_leds = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = leds_mask,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_leds));
+    update_leds();
 
-    // UART RS485
-    uart_config_t uart_cfg = { .baud_rate = 115200, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_EVEN, .stop_bits = UART_STOP_BITS_1 };
-    uart_driver_install(UART_RS485, 1024, 0, 0, NULL, 0);
-    uart_param_config(UART_RS485, &uart_cfg);
-    uart_set_pin(UART_RS485, RS485_TX_PIN, RS485_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    nvs_init_and_open();
+    nvs_load_all();
 
-    // Timer Display
-    const esp_timer_create_args_t timer_args = { .callback = &multiplex_timer_callback, .name = "mux" };
-    esp_timer_handle_t timer_h;
-    esp_timer_create(&timer_args, &timer_h);
-    esp_timer_start_periodic(timer_h, 4000);
+    for (int i = 0; i < PARAM_COUNT; i++) {
+        if (is_mi_synced_index(i)) {
+            params[i].pending_sync = true;
+        }
+    }
 
-    // Tasks
-    xTaskCreatePinnedToCore(ihm_sync_task, "sync", 4096, NULL, 5, NULL, 1);
-    xTaskCreate(uart_console_task, "console", 2048, NULL, 4, NULL);
+    g_frame_q = xQueueCreate(10, sizeof(frame_t));
+    init_rs485_uart();
 
-    printf("IHM Integrada: Simulação UART Ativa. Use START/STOP/UP/DOWN no terminal.\n");
+    current_state = STATE_READY;
+    current_error_code = 0;
+    system_on = false;
+    motor_running = false;
+    target_frequency = clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
+    output_frequency = 0.0f;
+    update_display_logic();
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = &multiplex_timer_callback,
+        .name = "mux7seg"
+    };
+    esp_timer_handle_t timer_handle;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(timer_handle, MULTIPLEX_INTERVAL_US));
+
+    xTaskCreate(rs485_rx_task,       "rs485_rx",   4096, NULL, 10, NULL);
+    xTaskCreate(ihm_sync_task,       "ihm_sync",   4096, NULL,  8, NULL);
+    xTaskCreate(status_watchdog_task,"wd_status",  3072, NULL,  7, NULL);
+    xTaskCreate(mi_fault_task,       "mi_fault",   3072, NULL,  6, NULL);
+    xTaskCreate(console_task,        "console",    4096, NULL,  5, NULL);
+    xTaskCreate(sim_task,            "sim_task",   3072, NULL,  4, NULL);
 }

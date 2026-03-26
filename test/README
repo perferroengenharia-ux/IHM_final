@@ -1,11 +1,69 @@
+# IHM unificada ESP32
 
-This directory is intended for PlatformIO Test Runner and project tests.
+## Arquivos
+- `main_ihm_unificado.c`: código único da IHM para ESP32 DevKit V1, ESP-IDF / PlatformIO.
 
-Unit Testing is a software testing method by which individual units of
-source code, sets of one or more MCU program modules together with associated
-control data, usage procedures, and operating procedures, are tested to
-determine whether they are fit for use. Unit testing finds problems early
-in the development cycle.
+## Pinos mantidos
+### Display 7 segmentos
+- A = GPIO13
+- B = GPIO15
+- C = GPIO14
+- D = GPIO27
+- E = GPIO26
+- F = GPIO25
+- G = GPIO33
+- DP = GPIO32
+- Dígito 1 = GPIO23
+- Dígito 2 = GPIO22
+- Dígito 3 = GPIO21
 
-More information about PlatformIO Unit Testing:
-- https://docs.platformio.org/en/latest/advanced/unit-testing/index.html
+### Comunicação RS485
+- TX = GPIO17
+- RX = GPIO16
+- DE/RE = GPIO4
+- UART = UART2
+- 115200, 8E1
+
+## LEDs remapeados
+- Swing = GPIO18
+- Dreno = GPIO19
+- Climatizar = GPIO2
+- Ventilar = GPIO5
+- Exaustão = GPIO0
+
+> Observação: GPIO0 é pino de strap. No hardware final, mantenha este pino em nível alto no boot.
+
+## Botões físicos
+Os botões físicos ficaram apenas comentados no código.
+A simulação é feita pelo monitor serial.
+
+## Comandos do monitor serial
+- `ONOFF`
+- `MAIS`
+- `MENOS`
+- `SET`
+- `SETL`
+- `CLIMA`
+- `VENT`
+- `SWING`
+- `EXAUSTAO`
+- `DRENO`
+- `DL`  -> confirma início do dreno
+- `DF`  -> confirma fim do dreno
+- `DIR=0` ou `DIR=1`
+- `P20=25` (exemplo de alteração de parâmetro)
+- `MON` / `SIL`
+- `SIM1` / `SIM0`
+- `SIMWS1` / `SIMWS0`
+- `SIMWL1` / `SIMWL0`
+- `RESETWIFI`
+- `HELP`
+
+## Observação importante
+O MI atual em STM32 consome oficialmente:
+- byte 0 = botões
+- bytes 1 e 2 = frequência alvo
+- byte 3 = direção
+- byte 8 = E08
+
+Os bytes 4 e 5 foram preenchidos na IHM com flags auxiliares e estado do dreno para futura expansão, sem quebrar o firmware atual do MI.
