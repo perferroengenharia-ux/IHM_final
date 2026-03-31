@@ -110,6 +110,7 @@ static const gpio_num_t BTN_PINS[] = {
 #define AUX_BIT_EXAUSTAO        (1u << 2)
 #define AUX_BIT_DRENO           (1u << 3)
 #define AUX_BIT_SYSTEM_ON       (1u << 4)
+#define MI_STATUS_WATER_SHORTAGE (1u << 0)
 
 #define E02_DC_OV               2
 #define E03_DC_UV               3
@@ -189,6 +190,7 @@ typedef struct {
     uint16_t i_out;
     uint16_t v_out;
     uint8_t temp_igbt;
+    uint8_t status_flags;
 } mi_telemetry_t;
 
 enum {
@@ -295,6 +297,7 @@ static bool sim_wl = false;
 
 static int current_param_idx = IDX_P00;
 static int current_error_code = 0;
+static bool fault_clear_pending_ack = false;
 static int temp_edit_value = 0;
 static int saved_frequency = 1;
 static int target_frequency = 1;            /* Hz */
@@ -589,6 +592,18 @@ static void update_leds(void) {
     gpio_set_level(LED_EXAUSTAO_PIN, exaustao_on ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
 }
 
+static void refresh_run_ready_state_from_output(void) {
+    if (current_state == STATE_ERROR || current_state == STATE_MENU_SEL || current_state == STATE_MENU_EDIT) {
+        return;
+    }
+
+    if (motor_running || output_frequency > 0.1f) {
+        current_state = STATE_RUN;
+    } else {
+        current_state = STATE_READY;
+    }
+}
+
 static void update_display_logic(void) {
     int val = 0;
 
@@ -719,17 +734,31 @@ static void enter_error(int code) {
     }
 
     current_error_code = code;
+    fault_clear_pending_ack = false;
     params[IDX_P06].value = code;
     error_history_push((uint8_t)code);
 
     current_state = STATE_ERROR;
     motor_running = false;
+    system_on = false;
+    pulse_buttons(BTN_BIT_STOP);
+    update_display_logic();
+    update_leds();
+}
+
+static void clear_error_manual_ack(void) {
+    current_error_code = 0;
+    fault_clear_pending_ack = false;
+    motor_running = false;
+    system_on = false;
+    refresh_run_ready_state_from_output();
     update_display_logic();
     update_leds();
 }
 
 static void clear_error_auto(void) {
     current_error_code = 0;
+    fault_clear_pending_ack = false;
 
     if (params[IDX_P44].value == 1 && motor_was_running_before_error) {
         motor_running = true;
@@ -739,11 +768,8 @@ static void clear_error_auto(void) {
         pulse_buttons(BTN_BIT_START);
     } else {
         motor_running = false;
-        if (!system_on) {
-            current_state = STATE_READY;
-        } else {
-            current_state = STATE_READY;
-        }
+        system_on = false;
+        refresh_run_ready_state_from_output();
     }
 
     update_display_logic();
@@ -1089,6 +1115,7 @@ static void ihm_sync_task(void *arg) {
                 g_telemetry.v_bus = (uint16_t)((rep.payload[4] << 8) | rep.payload[5]);
                 g_telemetry.v_out = (uint16_t)((rep.payload[6] << 8) | rep.payload[7]);
                 g_telemetry.temp_igbt = rep.payload[8];
+                g_telemetry.status_flags = (rep.len >= 10) ? rep.payload[9] : 0u;
                 portEXIT_CRITICAL(&meas_mux);
 
                 output_frequency = ((float)g_telemetry.current_freq_centi_hz) / 100.0f;
@@ -1097,6 +1124,8 @@ static void ihm_sync_task(void *arg) {
                 params[IDX_P03].value = clamp_i(telemetry_current_ma_to_display_a(g_telemetry.i_out), 0, params[IDX_P03].max_val);
                 params[IDX_P04].value = g_telemetry.v_out;
                 params[IDX_P05].value = g_telemetry.temp_igbt;
+                water_shortage = sim_ws || ((g_telemetry.status_flags & MI_STATUS_WATER_SHORTAGE) != 0u);
+                refresh_run_ready_state_from_output();
 
                 if (g_show_logs) {
                     ESP_LOGI(TAG, "RX Freq=%.2fHz I=%umA Vbus=%u Vout=%u Temp=%u",
@@ -1248,7 +1277,10 @@ static void mi_fault_task(void *arg) {
         if (allow_override && hold_e02 >= FAULT_HOLD_MS) enter_error(E02_DC_OV);
         if (current_state == STATE_ERROR && current_error_code == E02_DC_OV) {
             clr_e02 = (!e02) ? (clr_e02 + WD_CHECK_MS) : 0;
-            if (clr_e02 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+            if (clr_e02 >= FAULT_CLEAR_HOLD_MS) {
+                if (params[IDX_P44].value == 1) clear_error_auto();
+                else fault_clear_pending_ack = true;
+            }
         } else clr_e02 = 0;
 
         bool e03 = (dc > 0 && dc < DC_UV_THRESHOLD);
@@ -1256,7 +1288,10 @@ static void mi_fault_task(void *arg) {
         if (allow_override && hold_e03 >= FAULT_HOLD_MS) enter_error(E03_DC_UV);
         if (current_state == STATE_ERROR && current_error_code == E03_DC_UV) {
             clr_e03 = (!e03) ? (clr_e03 + WD_CHECK_MS) : 0;
-            if (clr_e03 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+            if (clr_e03 >= FAULT_CLEAR_HOLD_MS) {
+                if (params[IDX_P44].value == 1) clear_error_auto();
+                else fault_clear_pending_ack = true;
+            }
         } else clr_e03 = 0;
 
         bool e04 = (tmp > IGBT_OT_THRESHOLD);
@@ -1264,7 +1299,10 @@ static void mi_fault_task(void *arg) {
         if (allow_override && hold_e04 >= FAULT_HOLD_MS) enter_error(E04_IGBT_OT);
         if (current_state == STATE_ERROR && current_error_code == E04_IGBT_OT) {
             clr_e04 = (!e04) ? (clr_e04 + WD_CHECK_MS) : 0;
-            if (clr_e04 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+            if (clr_e04 >= FAULT_CLEAR_HOLD_MS) {
+                if (params[IDX_P44].value == 1) clear_error_auto();
+                else fault_clear_pending_ack = true;
+            }
         } else clr_e04 = 0;
 
         bool e05 = telemetry_overload_trip(cur_ma);
@@ -1272,7 +1310,10 @@ static void mi_fault_task(void *arg) {
         if (allow_override && hold_e05 >= FAULT_HOLD_MS) enter_error(E05_OVL);
         if (current_state == STATE_ERROR && current_error_code == E05_OVL) {
             clr_e05 = (!e05) ? (clr_e05 + WD_CHECK_MS) : 0;
-            if (clr_e05 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+            if (clr_e05 >= FAULT_CLEAR_HOLD_MS) {
+                if (params[IDX_P44].value == 1) clear_error_auto();
+                else fault_clear_pending_ack = true;
+            }
         } else clr_e05 = 0;
 
         bool e07 = (line > 0 && line < params[IDX_P45].value);
@@ -1280,7 +1321,10 @@ static void mi_fault_task(void *arg) {
         if (allow_override && hold_e07 >= FAULT_HOLD_MS) enter_error(E07_LINE_UV);
         if (current_state == STATE_ERROR && current_error_code == E07_LINE_UV) {
             clr_e07 = (!e07) ? (clr_e07 + WD_CHECK_MS) : 0;
-            if (clr_e07 >= FAULT_CLEAR_HOLD_MS) clear_error_auto();
+            if (clr_e07 >= FAULT_CLEAR_HOLD_MS) {
+                if (params[IDX_P44].value == 1) clear_error_auto();
+                else fault_clear_pending_ack = true;
+            }
         } else clr_e07 = 0;
 
         update_display_logic();
@@ -1439,7 +1483,7 @@ static void set_motor_running(bool run) {
     } else {
         motor_running = false;
         system_on = false;
-        current_state = STATE_READY;
+        refresh_run_ready_state_from_output();
         if (params[IDX_P12].value == 1) {
             saved_frequency = target_frequency;
             nvs_save_saved_frequency();
@@ -1497,6 +1541,13 @@ static void handle_button_event(button_id_t id, bool long_press) {
     }
 
     if (id == BTN_ONOFF) {
+        if (current_state == STATE_ERROR && current_error_code != E08_COMM) {
+            if (params[IDX_P44].value == 0 && fault_clear_pending_ack) {
+                clear_error_manual_ack();
+            }
+            return;
+        }
+
         set_motor_running(!motor_running);
         dreno_status = DRENO_IDLE;
         if (!motor_running) {
@@ -1784,6 +1835,7 @@ void app_main(void) {
     motor_running = false;
     target_frequency = clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
     output_frequency = 0.0f;
+    g_telemetry.status_flags = 0;
     update_display_logic();
 
     const esp_timer_create_args_t timer_args = {
