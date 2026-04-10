@@ -299,6 +299,16 @@ static bool g_show_logs = false;
 static bool sim_ws = false;
 static bool sim_wl = false;
 
+static bool prewet_active = false;
+static bool dryrun_active = false;
+static int64_t prewet_end_us = 0;
+static int64_t dryrun_end_us = 0;
+static int saved_target_before_stop = 0;
+static bool saved_error_bomba_on = false;
+static bool saved_error_swing_on = false;
+static bool saved_error_exaustao_on = false;
+static bool saved_error_system_on = false;
+
 static int current_param_idx = IDX_P00;
 static int current_error_code = 0;
 static bool fault_clear_pending_ack = false;
@@ -331,6 +341,16 @@ static uint8_t g_button_pulse_mask = 0;
 static int64_t g_button_pulse_until_us = 0;
 static uint8_t g_direction = 0; /* 0=FWD, 1=REV */
 
+static void update_display_logic(void);
+static void update_leds(void);
+static void dreno_service(void);
+static void phase_service(void);
+static void finish_prewet_now(void);
+static void finish_dryrun_now(bool immediate_stop);
+static void force_finish_all_timed_cycles(void);
+static void set_motor_running_ex(bool run, bool skip_timers);
+static void handle_dreno_end(void);
+
 /* ============================================================
  * UTILITÁRIOS
  * ============================================================ */
@@ -353,6 +373,8 @@ static bool is_mi_synced_index(int idx) {
         case IDX_P44:
         case IDX_P45:
         case IDX_P80:
+        case IDX_P81:
+        case IDX_P82:
         case IDX_P83:
         case IDX_P84:
         case IDX_P85:
@@ -387,7 +409,8 @@ static uint8_t consume_button_mask_for_tx(void) {
 }
 
 static void normalize_local_modes_by_params(void) {
-    if (params[IDX_P81].value != 1) {
+    /* P81: 0=desabilitado, 1=NA, 2=NF.\n     * Na IHM, 1 e 2 significam 'swing habilitado'; a polaridade real\n     * é aplicada no MI. Só P81=0 força desligado. */
+    if (params[IDX_P81].value == 0) {
         swing_on = false;
     }
 
@@ -407,9 +430,11 @@ static void maybe_clear_button_pulse_after_tx(void) {
 static uint8_t get_aux_flags(void) {
     normalize_local_modes_by_params();
 
+    bool motor_active_ui = (motor_running || output_frequency > 0.1f) && !prewet_active && !dryrun_active;
+
     uint8_t f = 0;
     if (bomba_on)      f |= AUX_BIT_BOMBA;
-    if (swing_on)      f |= AUX_BIT_SWING;
+    if (swing_on && motor_active_ui) f |= AUX_BIT_SWING;
     if (exaustao_on)   f |= AUX_BIT_EXAUSTAO;
     if (dreno_status != DRENO_IDLE) f |= AUX_BIT_DRENO;
     if (system_on)     f |= AUX_BIT_SYSTEM_ON;
@@ -443,6 +468,10 @@ static uint8_t get_char_pattern(char c) {
         case 'R': return 0b01010000;
         case 'D': return 0b01011110;
         case 'Y': return 0b01101110;
+        case 'O': return 0b00111111;
+        case 'F': return 0b01110001;
+        case 'L': return 0b00111000;
+        case 'I': return 0b00000110;
         case ' ': return 0b00000000;
         default:  return 0b00000000;
     }
@@ -468,8 +497,6 @@ static void trim_spaces(char *s) {
         s[--n] = '\0';
     }
 }
-
-static void dreno_service(void);
 
 /* ============================================================
  * NVS / PARÂMETROS
@@ -610,7 +637,8 @@ static void update_leds(void) {
         return;
     }
 
-    gpio_set_level(LED_SWING_PIN,    swing_on ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
+    bool motor_active_ui = (motor_running || output_frequency > 0.1f) && !prewet_active && !dryrun_active;
+    gpio_set_level(LED_SWING_PIN,    (swing_on && motor_active_ui) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
     gpio_set_level(LED_DRENO_PIN,    LED_ACTIVE_OFF);
     gpio_set_level(LED_CLIMA_PIN,    (bomba_on && !exaustao_on) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
     gpio_set_level(LED_VENT_PIN,     (!bomba_on && !exaustao_on) ? LED_ACTIVE_ON : LED_ACTIVE_OFF);
@@ -622,7 +650,7 @@ static void refresh_run_ready_state_from_output(void) {
         return;
     }
 
-    if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
+    if (dreno_status != DRENO_IDLE || dreno_post_wait_active || prewet_active || dryrun_active) {
         return;
     }
 
@@ -637,10 +665,22 @@ static void update_display_logic(void) {
     int val = 0;
 
     if (current_state != STATE_ERROR && current_state != STATE_MENU_SEL && current_state != STATE_MENU_EDIT) {
+        if (prewet_active) {
+            display_buffer[0] = get_char_pattern('L');
+            display_buffer[1] = get_char_pattern('I');
+            display_buffer[2] = get_char_pattern('P');
+            return;
+        }
+        if (dryrun_active) {
+            display_buffer[0] = get_char_pattern('S');
+            display_buffer[1] = get_char_pattern('E');
+            display_buffer[2] = get_char_pattern('C');
+            return;
+        }
         if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
-            display_buffer[0] = get_char_pattern(' ');
-            display_buffer[1] = get_char_pattern(' ');
-            display_buffer[2] = get_char_pattern('0');
+            display_buffer[0] = get_char_pattern('O');
+            display_buffer[1] = get_char_pattern('F');
+            display_buffer[2] = get_char_pattern('F');
             return;
         }
     }
@@ -769,7 +809,16 @@ static void enter_error(int code) {
     if (current_state != STATE_ERROR) {
         motor_was_running_before_error = motor_running;
         target_before_error = target_frequency;
+        saved_error_bomba_on = bomba_on;
+        saved_error_swing_on = swing_on;
+        saved_error_exaustao_on = exaustao_on;
+        saved_error_system_on = system_on;
     }
+
+    prewet_active = false;
+    prewet_end_us = 0;
+    dryrun_active = false;
+    dryrun_end_us = 0;
 
     current_error_code = code;
     fault_clear_pending_ack = false;
@@ -787,9 +836,19 @@ static void enter_error(int code) {
 static void clear_error_manual_ack(void) {
     current_error_code = 0;
     fault_clear_pending_ack = false;
+    prewet_active = false;
+    prewet_end_us = 0;
+    dryrun_active = false;
+    dryrun_end_us = 0;
     motor_running = false;
-    system_on = false;
+    system_on = saved_error_system_on;
+    bomba_on = saved_error_bomba_on;
+    swing_on = saved_error_swing_on;
+    exaustao_on = saved_error_exaustao_on;
     current_state = STATE_READY;
+    saved_resume_bomba_on = bomba_on;
+    saved_resume_swing_on = swing_on;
+    normalize_local_modes_by_params();
     update_display_logic();
     update_leds();
 }
@@ -797,16 +856,29 @@ static void clear_error_manual_ack(void) {
 static void clear_error_auto(void) {
     current_error_code = 0;
     fault_clear_pending_ack = false;
+    prewet_active = false;
+    prewet_end_us = 0;
+    dryrun_active = false;
+    dryrun_end_us = 0;
+
+    bomba_on = saved_error_bomba_on;
+    swing_on = saved_error_swing_on;
+    exaustao_on = saved_error_exaustao_on;
+    saved_resume_bomba_on = bomba_on;
+    saved_resume_swing_on = swing_on;
+    normalize_local_modes_by_params();
 
     if (params[IDX_P44].value == 1 && motor_was_running_before_error) {
         motor_running = true;
         system_on = true;
         current_state = STATE_RUN;
-        target_frequency = clamp_i(target_before_error, params[IDX_P20].value, params[IDX_P21].value);
+        target_frequency = (params[IDX_P12].value == 1)
+            ? clamp_i(target_before_error, params[IDX_P20].value, params[IDX_P21].value)
+            : params[IDX_P20].value;
         pulse_buttons(BTN_BIT_START);
     } else {
         motor_running = false;
-        system_on = false;
+        system_on = saved_error_system_on;
         current_state = STATE_READY;
         refresh_run_ready_state_from_output();
     }
@@ -1071,6 +1143,7 @@ static void sim_task(void *arg) {
         wifi_lost = sim_wl;
         water_shortage = sim_ws || ((g_telemetry.status_flags & MI_STATUS_WATER_SHORTAGE) != 0u);
         dreno_service();
+        phase_service();
         update_display_logic();
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -1144,8 +1217,8 @@ static void ihm_sync_task(void *arg) {
                         break;
                     }
                 }
-                if (needs_sync && g_telemetry.current_freq_centi_hz == 0) {
-                    ESP_LOGI(TAG, "Motor parado. Sincronizando pendências...");
+                if (needs_sync) {
+                    ESP_LOGI(TAG, "Sincronizando pendências com o MI...");
                     sync_params_to_mi(false);
                 }
             }
@@ -1471,31 +1544,130 @@ static void change_menu_or_frequency(int dir) {
     }
 }
 
-static void set_motor_running(bool run) {
+static void finish_prewet_now(void) {
+    if (!prewet_active) return;
+    prewet_active = false;
+    prewet_end_us = 0;
+    motor_running = true;
+    system_on = true;
+    current_state = STATE_RUN;
+    pulse_buttons(BTN_BIT_START);
+    update_display_logic();
+    update_leds();
+}
+
+static void finish_dryrun_now(bool immediate_stop) {
+    if (!dryrun_active) return;
+    dryrun_active = false;
+    dryrun_end_us = 0;
+
+    motor_running = false;
+    system_on = false;
+    if (params[IDX_P12].value == 1) {
+        saved_frequency = clamp_i(saved_target_before_stop, params[IDX_P20].value, params[IDX_P21].value);
+        nvs_save_saved_frequency();
+    }
+    pulse_buttons(BTN_BIT_STOP);
+    if (immediate_stop) {
+        current_state = STATE_READY;
+    } else {
+        refresh_run_ready_state_from_output();
+        current_state = STATE_READY;
+    }
+    update_display_logic();
+    update_leds();
+}
+
+static void force_finish_all_timed_cycles(void) {
+    if (prewet_active) {
+        finish_prewet_now();
+        return;
+    }
+    if (dryrun_active) {
+        finish_dryrun_now(true);
+        return;
+    }
+    if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
+        handle_dreno_end();
+    }
+}
+
+static void phase_service(void) {
+    int64_t now = esp_timer_get_time();
+
+    if (prewet_active && prewet_end_us > 0 && now >= prewet_end_us) {
+        finish_prewet_now();
+    }
+
+    if (dryrun_active && dryrun_end_us > 0 && now >= dryrun_end_us) {
+        finish_dryrun_now(false);
+    }
+}
+
+static void set_motor_running_ex(bool run, bool skip_timers) {
     if (run) {
         system_on = true;
-        motor_running = true;
-        current_state = STATE_RUN;
-        target_frequency = (params[IDX_P12].value == 1) ? saved_frequency : params[IDX_P20].value;
         bomba_on = saved_resume_bomba_on;
         swing_on = saved_resume_swing_on;
         exaustao_on = false;
         normalize_local_modes_by_params();
-        pulse_buttons(BTN_BIT_START);
+        target_frequency = (params[IDX_P12].value == 1) ? saved_frequency : params[IDX_P20].value;
+
+        dryrun_active = false;
+        dryrun_end_us = 0;
+
+        if (!skip_timers && bomba_on && !exaustao_on && params[IDX_P30].value > 0) {
+            prewet_active = true;
+            prewet_end_us = esp_timer_get_time() + ((int64_t)params[IDX_P30].value * 60LL * 1000000LL);
+            motor_running = false;
+            current_state = STATE_RUN;
+        } else {
+            prewet_active = false;
+            prewet_end_us = 0;
+            motor_running = true;
+            current_state = STATE_RUN;
+            pulse_buttons(BTN_BIT_START);
+        }
     } else {
         saved_resume_bomba_on = exaustao_on ? saved_bomba_on : bomba_on;
         saved_resume_swing_on = swing_on;
-        motor_running = false;
-        system_on = false;
-        refresh_run_ready_state_from_output();
-        if (params[IDX_P12].value == 1) {
-            saved_frequency = target_frequency;
-            nvs_save_saved_frequency();
+        saved_target_before_stop = clamp_i(target_frequency, params[IDX_P20].value, params[IDX_P21].value);
+
+        if (!skip_timers && motor_running && bomba_on && !exaustao_on && params[IDX_P31].value > 0) {
+            prewet_active = false;
+            prewet_end_us = 0;
+            dryrun_active = true;
+            dryrun_end_us = esp_timer_get_time() + ((int64_t)params[IDX_P31].value * 60LL * 1000000LL);
+            bomba_on = false;
+            current_state = STATE_RUN;
+            if (params[IDX_P32].value == 0) {
+                float hold_src = (output_frequency > 0.1f) ? output_frequency : (float)target_frequency;
+                int hold_freq = (int)(hold_src + 0.5f);
+                target_frequency = clamp_i(hold_freq, params[IDX_P20].value, params[IDX_P21].value);
+            } else {
+                target_frequency = clamp_i(params[IDX_P32].value, params[IDX_P20].value, params[IDX_P21].value);
+            }
+        } else {
+            prewet_active = false;
+            prewet_end_us = 0;
+            dryrun_active = false;
+            dryrun_end_us = 0;
+            motor_running = false;
+            system_on = false;
+            refresh_run_ready_state_from_output();
+            if (params[IDX_P12].value == 1) {
+                saved_frequency = clamp_i(saved_target_before_stop, params[IDX_P20].value, params[IDX_P21].value);
+                nvs_save_saved_frequency();
+            }
+            pulse_buttons(BTN_BIT_STOP);
         }
-        pulse_buttons(BTN_BIT_STOP);
     }
     update_display_logic();
     update_leds();
+}
+
+static void set_motor_running(bool run) {
+    set_motor_running_ex(run, false);
 }
 
 static void handle_dreno_led(void) {
@@ -1515,7 +1687,11 @@ static void handle_dreno_end(void) {
         bomba_on = false;
         swing_on = false;
         exaustao_on = false;
-        set_motor_running(false);
+        prewet_active = false;
+        prewet_end_us = 0;
+        dryrun_active = false;
+        dryrun_end_us = 0;
+        set_motor_running_ex(false, true);
         current_state = STATE_READY;
         ESP_LOGW(TAG, "MI informou fim do dreno.");
         update_leds();
@@ -1580,6 +1756,11 @@ static void handle_button_event(button_id_t id, bool long_press) {
     }
 
     if (id == BTN_ONOFF) {
+        if (long_press && (prewet_active || dryrun_active || dreno_status != DRENO_IDLE || dreno_post_wait_active)) {
+            force_finish_all_timed_cycles();
+            return;
+        }
+
         if (current_state == STATE_ERROR && current_error_code != E08_COMM) {
             if (params[IDX_P44].value == 0 && fault_clear_pending_ack) {
                 clear_error_manual_ack();
@@ -1592,16 +1773,35 @@ static void handle_button_event(button_id_t id, bool long_press) {
             return;
         }
 
-        set_motor_running(!motor_running);
+        if (prewet_active) {
+            if (long_press) {
+                finish_prewet_now();
+            } else {
+                prewet_active = false;
+                prewet_end_us = 0;
+                system_on = false;
+                motor_running = false;
+                refresh_run_ready_state_from_output();
+                update_display_logic();
+                update_leds();
+            }
+            return;
+        }
+
+        if (dryrun_active) {
+            if (long_press) {
+                finish_dryrun_now(true);
+            } else {
+                ESP_LOGW(TAG, "Aguardando fim do tempo de desligamento P31. Use ONOFFL para pular.");
+            }
+            return;
+        }
+
+        set_motor_running_ex(!motor_running, long_press);
         dreno_status = DRENO_IDLE;
         dreno_post_wait_active = false;
         dreno_auto_off_us = 0;
         dreno_ready_release_us = 0;
-        if (!motor_running) {
-            bomba_on = false;
-            swing_on = false;
-            exaustao_on = false;
-        }
         update_leds();
         return;
     }
@@ -1634,9 +1834,11 @@ static void handle_button_event(button_id_t id, bool long_press) {
             bomba_on = false;
             break;
         case BTN_SWING:
-            if (params[IDX_P81].value != 1) {
+            if (params[IDX_P81].value == 0) {
                 swing_on = false;
-                ESP_LOGW(TAG, "Swing desabilitado: P81 deve ser 1.");
+                ESP_LOGW(TAG, "Swing desabilitado: P81=0.");
+            } else if (!(motor_running || output_frequency > 0.1f) || prewet_active || dryrun_active) {
+                ESP_LOGW(TAG, "Swing só pode ser acionado com o motor ligado.");
             } else {
                 swing_on = !swing_on;
             }
@@ -1711,6 +1913,7 @@ static void handle_button_event(button_id_t id, bool long_press) {
 static void print_help(void) {
     printf("\n=== COMANDOS IHM ===\n");
     printf("ONOFF           -> liga/desliga motor\n");
+    printf("ONOFFL          -> longo pressionamento do ONOFF (pula tempos)\n");
     printf("MAIS / MENOS    -> ajuste de frequência ou navegação no menu\n");
     printf("SET             -> entra/edita/confirma menu\n");
     printf("SETL            -> longo pressionamento do SET (voltar/sair)\n");
@@ -1783,6 +1986,10 @@ static void process_console_command(char *cmd) {
         }
     }
 
+    if (strcasecmp(cmd, "ONOFFL") == 0) {
+        handle_button_event(BTN_ONOFF, true);
+        return;
+    }
     if (strcasecmp(cmd, "ONOFF") == 0 || strcasecmp(cmd, "POWER") == 0 || strcasecmp(cmd, "S") == 0) {
         handle_button_event(BTN_ONOFF, false);
         return;
@@ -1921,6 +2128,10 @@ void app_main(void) {
     saved_resume_bomba_on = bomba_on;
     saved_resume_swing_on = swing_on;
     output_frequency = 0.0f;
+    prewet_active = false;
+    dryrun_active = false;
+    prewet_end_us = 0;
+    dryrun_end_us = 0;
     g_telemetry.status_flags = 0;
     update_display_logic();
 
