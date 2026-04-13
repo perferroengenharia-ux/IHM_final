@@ -293,6 +293,7 @@ static bool exaustao_on = false;
 static bool saved_bomba_on = false;
 static bool saved_resume_bomba_on = false;
 static bool saved_resume_swing_on = false;
+static bool saved_resume_exaustao_on = false;
 static bool wifi_lost = false;
 static bool water_shortage = false;
 static bool g_show_logs = false;
@@ -350,6 +351,7 @@ static void finish_dryrun_now(bool immediate_stop);
 static void force_finish_all_timed_cycles(void);
 static void set_motor_running_ex(bool run, bool skip_timers);
 static void handle_dreno_end(void);
+static void request_mi_factory_reset(void);
 
 /* ============================================================
  * UTILITÁRIOS
@@ -848,6 +850,7 @@ static void clear_error_manual_ack(void) {
      * Apenas memoriza o estado anterior para o próximo comando de partida. */
     saved_resume_bomba_on = saved_error_bomba_on;
     saved_resume_swing_on = saved_error_swing_on;
+    saved_resume_exaustao_on = saved_error_exaustao_on;
     saved_bomba_on = saved_error_bomba_on;
 
     system_on = false;
@@ -875,6 +878,7 @@ static void clear_error_auto(void) {
     exaustao_on = saved_error_exaustao_on;
     saved_resume_bomba_on = bomba_on;
     saved_resume_swing_on = swing_on;
+    saved_resume_exaustao_on = exaustao_on;
     normalize_local_modes_by_params();
 
     if (params[IDX_P44].value == 1 && motor_was_running_before_error) {
@@ -1093,6 +1097,20 @@ static bool sync_params_to_mi(bool force_all) {
     }
 
     return true;
+}
+
+static void request_mi_factory_reset(void) {
+    uint8_t tx_payload[3];
+    frame_t rep;
+    tx_payload[0] = 0u;
+    tx_payload[1] = 0u;
+    tx_payload[2] = 101u;
+
+    if (!rs485_request(TYPE_WRITE_PARAM, tx_payload, 3, &rep, 200)) {
+        ESP_LOGW(TAG, "MI factory reset command failed.");
+    } else {
+        ESP_LOGI(TAG, "MI factory reset command sent.");
+    }
 }
 
 static void init_rs485_uart(void) {
@@ -1321,7 +1339,7 @@ static void status_watchdog_task(void *arg) {
                     if (params[IDX_P44].value == 1) {
                         clear_error_auto();
                     } else {
-                        fault_clear_pending_ack = true;
+                        clear_error_manual_ack();
                     }
                 }
             }
@@ -1363,7 +1381,7 @@ static void mi_fault_task(void *arg) {
             clr_e02 = (!e02) ? (clr_e02 + WD_CHECK_MS) : 0;
             if (clr_e02 >= FAULT_CLEAR_HOLD_MS) {
                 if (params[IDX_P44].value == 1) clear_error_auto();
-                else fault_clear_pending_ack = true;
+                else clear_error_manual_ack();
             }
         } else clr_e02 = 0;
 
@@ -1374,7 +1392,7 @@ static void mi_fault_task(void *arg) {
             clr_e03 = (!e03) ? (clr_e03 + WD_CHECK_MS) : 0;
             if (clr_e03 >= FAULT_CLEAR_HOLD_MS) {
                 if (params[IDX_P44].value == 1) clear_error_auto();
-                else fault_clear_pending_ack = true;
+                else clear_error_manual_ack();
             }
         } else clr_e03 = 0;
 
@@ -1385,7 +1403,7 @@ static void mi_fault_task(void *arg) {
             clr_e04 = (!e04) ? (clr_e04 + WD_CHECK_MS) : 0;
             if (clr_e04 >= FAULT_CLEAR_HOLD_MS) {
                 if (params[IDX_P44].value == 1) clear_error_auto();
-                else fault_clear_pending_ack = true;
+                else clear_error_manual_ack();
             }
         } else clr_e04 = 0;
 
@@ -1396,7 +1414,7 @@ static void mi_fault_task(void *arg) {
             clr_e05 = (!e05) ? (clr_e05 + WD_CHECK_MS) : 0;
             if (clr_e05 >= FAULT_CLEAR_HOLD_MS) {
                 if (params[IDX_P44].value == 1) clear_error_auto();
-                else fault_clear_pending_ack = true;
+                else clear_error_manual_ack();
             }
         } else clr_e05 = 0;
 
@@ -1407,7 +1425,7 @@ static void mi_fault_task(void *arg) {
             clr_e07 = (!e07) ? (clr_e07 + WD_CHECK_MS) : 0;
             if (clr_e07 >= FAULT_CLEAR_HOLD_MS) {
                 if (params[IDX_P44].value == 1) clear_error_auto();
-                else fault_clear_pending_ack = true;
+                else clear_error_manual_ack();
             }
         } else clr_e07 = 0;
 
@@ -1458,6 +1476,7 @@ static void apply_menu_enter_or_confirm(void) {
                 is_locked = !is_locked;
                 nvs_save_lock();
             } else if (temp_edit_value == 101 && !motor_active) {
+                request_mi_factory_reset();
                 for (int i = 0; i < PARAM_COUNT; i++) {
                     if (!params[i].read_only) {
                         params[i].value = params[i].def_val;
@@ -1469,6 +1488,7 @@ static void apply_menu_enter_or_confirm(void) {
                 enforce_param_coherence();
                 for (int i = 0; i < PARAM_COUNT; i++) {
                     if (!params[i].read_only) nvs_save_param_by_index(i);
+                    if (is_mi_synced_index(i)) params[i].pending_sync = true;
                 }
                 nvs_save_saved_frequency();
                 nvs_save_lock();
@@ -1622,7 +1642,8 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
         system_on = true;
         bomba_on = saved_resume_bomba_on;
         swing_on = saved_resume_swing_on;
-        exaustao_on = false;
+        exaustao_on = saved_resume_exaustao_on;
+        saved_bomba_on = saved_resume_bomba_on;
         normalize_local_modes_by_params();
         target_frequency = (params[IDX_P12].value == 1) ? saved_frequency : params[IDX_P20].value;
 
@@ -1644,6 +1665,7 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
     } else {
         saved_resume_bomba_on = exaustao_on ? saved_bomba_on : bomba_on;
         saved_resume_swing_on = swing_on;
+        saved_resume_exaustao_on = exaustao_on;
         saved_target_before_stop = clamp_i(target_frequency, params[IDX_P20].value, params[IDX_P21].value);
 
         if (!skip_timers && motor_running && bomba_on && !exaustao_on && params[IDX_P31].value > 0) {
@@ -1689,6 +1711,14 @@ static void handle_dreno_led(void) {
 
 static void handle_dreno_end(void) {
     if (dreno_status == DRENO_EM_CURSO || dreno_status == DRENO_AGUARDANDO_LED || dreno_post_wait_active) {
+        /* Preserve the peripheral state that existed before dreno started.
+         * set_motor_running_ex(false, ...) normally snapshots the CURRENT states,
+         * but during dreno they are intentionally forced off. If we do not preserve
+         * them here, the next start will forget climatizar/swing/exaustao. */
+        bool resume_bomba = saved_resume_bomba_on;
+        bool resume_swing = saved_resume_swing_on;
+        bool resume_exaustao = saved_resume_exaustao_on;
+
         dreno_status = DRENO_IDLE;
         dreno_post_wait_active = false;
         dreno_auto_off_us = 0;
@@ -1701,6 +1731,12 @@ static void handle_dreno_end(void) {
         dryrun_active = false;
         dryrun_end_us = 0;
         set_motor_running_ex(false, true);
+
+        saved_resume_bomba_on = resume_bomba;
+        saved_resume_swing_on = resume_swing;
+        saved_resume_exaustao_on = resume_exaustao;
+        saved_bomba_on = resume_bomba;
+
         current_state = STATE_READY;
         ESP_LOGW(TAG, "MI informou fim do dreno.");
         update_leds();
@@ -1881,6 +1917,7 @@ static void handle_button_event(button_id_t id, bool long_press) {
                 system_on = false;
                 motor_running = false;
                 current_state = STATE_READY;
+                saved_bomba_on = saved_resume_bomba_on;
                 pulse_buttons(BTN_BIT_STOP);
                 ESP_LOGW(TAG, "Dreno desligado manualmente por BTN_DRENO.");
                 break;
@@ -1891,6 +1928,10 @@ static void handle_button_event(button_id_t id, bool long_press) {
                 return;
             }
 
+            saved_resume_bomba_on = bomba_on;
+            saved_resume_swing_on = swing_on;
+            saved_resume_exaustao_on = exaustao_on;
+            saved_bomba_on = bomba_on;
             bomba_on = false;
             swing_on = false;
             exaustao_on = false;
@@ -2140,6 +2181,7 @@ void app_main(void) {
     target_frequency = clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
     saved_resume_bomba_on = bomba_on;
     saved_resume_swing_on = swing_on;
+    saved_resume_exaustao_on = exaustao_on;
     output_frequency = 0.0f;
     prewet_active = false;
     dryrun_active = false;
