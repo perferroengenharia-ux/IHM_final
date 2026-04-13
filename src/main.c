@@ -472,6 +472,8 @@ static uint8_t get_char_pattern(char c) {
         case 'F': return 0b01110001;
         case 'L': return 0b00111000;
         case 'I': return 0b00000110;
+        case 'S': return 0b01101101;
+        case 'C': return 0b00111001;
         case ' ': return 0b00000000;
         default:  return 0b00000000;
     }
@@ -678,9 +680,9 @@ static void update_display_logic(void) {
             return;
         }
         if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
-            display_buffer[0] = get_char_pattern('O');
-            display_buffer[1] = get_char_pattern('F');
-            display_buffer[2] = get_char_pattern('F');
+            display_buffer[0] = get_char_pattern('S');
+            display_buffer[1] = get_char_pattern('E');
+            display_buffer[2] = get_char_pattern('C');
             return;
         }
     }
@@ -841,14 +843,21 @@ static void clear_error_manual_ack(void) {
     dryrun_active = false;
     dryrun_end_us = 0;
     motor_running = false;
-    system_on = saved_error_system_on;
-    bomba_on = saved_error_bomba_on;
-    swing_on = saved_error_swing_on;
-    exaustao_on = saved_error_exaustao_on;
+
+    /* Com P44=0, reconhecer o erro NÃO deve religar o sistema nem periféricos.
+     * Apenas memoriza o estado anterior para o próximo comando de partida. */
+    saved_resume_bomba_on = saved_error_bomba_on;
+    saved_resume_swing_on = saved_error_swing_on;
+    saved_bomba_on = saved_error_bomba_on;
+
+    system_on = false;
+    bomba_on = false;
+    swing_on = false;
+    exaustao_on = false;
     current_state = STATE_READY;
-    saved_resume_bomba_on = bomba_on;
-    saved_resume_swing_on = swing_on;
+
     normalize_local_modes_by_params();
+    refresh_run_ready_state_from_output();
     update_display_logic();
     update_leds();
 }
@@ -1309,7 +1318,11 @@ static void status_watchdog_task(void *arg) {
 
             if (current_state == STATE_ERROR && current_error_code == E08_COMM) {
                 if (stable_ms >= COMM_STABLE_CLEAR_MS) {
-                    clear_error_auto();
+                    if (params[IDX_P44].value == 1) {
+                        clear_error_auto();
+                    } else {
+                        fault_clear_pending_ack = true;
+                    }
                 }
             }
         }
@@ -1666,10 +1679,6 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
     update_leds();
 }
 
-static void set_motor_running(bool run) {
-    set_motor_running_ex(run, false);
-}
-
 static void handle_dreno_led(void) {
     if (dreno_status == DRENO_AGUARDANDO_LED) {
         dreno_status = DRENO_EM_CURSO;
@@ -1777,13 +1786,7 @@ static void handle_button_event(button_id_t id, bool long_press) {
             if (long_press) {
                 finish_prewet_now();
             } else {
-                prewet_active = false;
-                prewet_end_us = 0;
-                system_on = false;
-                motor_running = false;
-                refresh_run_ready_state_from_output();
-                update_display_logic();
-                update_leds();
+                ESP_LOGW(TAG, "Aguardando fim do tempo de molhamento P30. Use ONOFFL para pular.");
             }
             return;
         }
@@ -1803,6 +1806,16 @@ static void handle_button_event(button_id_t id, bool long_press) {
         dreno_auto_off_us = 0;
         dreno_ready_release_us = 0;
         update_leds();
+        return;
+    }
+
+    if (prewet_active) {
+        ESP_LOGW(TAG, "Comando bloqueado: durante o tempo de molhamento P30, somente ONOFFL pode pular o ciclo.");
+        return;
+    }
+
+    if (dryrun_active) {
+        ESP_LOGW(TAG, "Comando bloqueado: durante o tempo de secagem P31, somente ONOFFL pode pular o ciclo.");
         return;
     }
 
