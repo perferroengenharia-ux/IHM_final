@@ -253,7 +253,7 @@ static parameter_t params[PARAM_COUNT] = {
     {51,   0,   0,   0,   1, false, false},
     {80,   0,   0,   0,   2, false, false},
     {81,   0,   0,   0,   1, false, false},
-    {82,   0,   0,   0,   2, false, false},
+    {82,   1,   1,   0,   2, false, false},
     {83,  10,  10,   1, 240, false, false},
     {84,   5,   5,   1, 240, false, false},
     {85,   1,   1,   0,   2, false, false},
@@ -294,6 +294,12 @@ static bool saved_bomba_on = false;
 static bool saved_resume_bomba_on = false;
 static bool saved_resume_swing_on = false;
 static bool saved_resume_exaustao_on = false;
+static bool saved_exaustao_swing_on = false;
+static bool exaustao_restart_pending = false;
+static bool exaustao_exit_pending = false;
+static int exaustao_saved_frequency = 0;
+static int64_t exaustao_end_us = 0;
+static uint8_t exaustao_pending_direction = 0;
 static bool wifi_lost = false;
 static bool water_shortage = false;
 static bool g_show_logs = false;
@@ -302,6 +308,10 @@ static bool sim_wl = false;
 
 static bool prewet_active = false;
 static bool dryrun_active = false;
+static bool dryrun_restart_pending = false;
+static bool dryrun_exit_restore_pending = false;
+static uint8_t dryrun_restore_direction = 0;
+static uint8_t dryrun_pending_direction = 0;
 static int64_t prewet_end_us = 0;
 static int64_t dryrun_end_us = 0;
 static int saved_target_before_stop = 0;
@@ -346,6 +356,8 @@ static void update_display_logic(void);
 static void update_leds(void);
 static void dreno_service(void);
 static void phase_service(void);
+static void exaustao_service(void);
+static void request_exaustao_stop(void);
 static void finish_prewet_now(void);
 static void finish_dryrun_now(bool immediate_stop);
 static void force_finish_all_timed_cycles(void);
@@ -374,6 +386,7 @@ static bool is_mi_synced_index(int idx) {
         case IDX_P43:
         case IDX_P44:
         case IDX_P45:
+        case IDX_P51:
         case IDX_P80:
         case IDX_P81:
         case IDX_P82:
@@ -476,6 +489,7 @@ static uint8_t get_char_pattern(char c) {
         case 'I': return 0b00000110;
         case 'S': return 0b01101101;
         case 'C': return 0b00111001;
+        case 'N': return 0b01010100;
         case ' ': return 0b00000000;
         default:  return 0b00000000;
     }
@@ -682,9 +696,9 @@ static void update_display_logic(void) {
             return;
         }
         if (dreno_status != DRENO_IDLE || dreno_post_wait_active) {
-            display_buffer[0] = get_char_pattern('S');
-            display_buffer[1] = get_char_pattern('E');
-            display_buffer[2] = get_char_pattern('C');
+            display_buffer[0] = get_char_pattern('D');
+            display_buffer[1] = get_char_pattern('R');
+            display_buffer[2] = get_char_pattern('N');
             return;
         }
     }
@@ -822,6 +836,8 @@ static void enter_error(int code) {
     prewet_active = false;
     prewet_end_us = 0;
     dryrun_active = false;
+    dryrun_restart_pending = false;
+    dryrun_exit_restore_pending = false;
     dryrun_end_us = 0;
 
     current_error_code = code;
@@ -843,6 +859,8 @@ static void clear_error_manual_ack(void) {
     prewet_active = false;
     prewet_end_us = 0;
     dryrun_active = false;
+    dryrun_restart_pending = false;
+    dryrun_exit_restore_pending = false;
     dryrun_end_us = 0;
     motor_running = false;
 
@@ -857,6 +875,9 @@ static void clear_error_manual_ack(void) {
     bomba_on = false;
     swing_on = false;
     exaustao_on = false;
+    exaustao_restart_pending = false;
+    exaustao_exit_pending = false;
+    g_direction = (uint8_t)params[IDX_P51].value;
     current_state = STATE_READY;
 
     normalize_local_modes_by_params();
@@ -871,6 +892,8 @@ static void clear_error_auto(void) {
     prewet_active = false;
     prewet_end_us = 0;
     dryrun_active = false;
+    dryrun_restart_pending = false;
+    dryrun_exit_restore_pending = false;
     dryrun_end_us = 0;
 
     bomba_on = saved_error_bomba_on;
@@ -880,6 +903,7 @@ static void clear_error_auto(void) {
     saved_resume_swing_on = swing_on;
     saved_resume_exaustao_on = exaustao_on;
     normalize_local_modes_by_params();
+    g_direction = exaustao_on ? (uint8_t)(params[IDX_P51].value ? 0 : 1) : (uint8_t)params[IDX_P51].value;
 
     if (params[IDX_P44].value == 1 && motor_was_running_before_error) {
         motor_running = true;
@@ -1506,6 +1530,9 @@ static void apply_menu_enter_or_confirm(void) {
                         !(p_id == 21 && temp_edit_value <= params[IDX_P20].value)) {
                         params[current_param_idx].value = temp_edit_value;
                         enforce_param_coherence();
+                        if (current_param_idx == IDX_P51) {
+                            g_direction = exaustao_on ? (uint8_t)(params[IDX_P51].value ? 0 : 1) : (uint8_t)params[IDX_P51].value;
+                        }
                         nvs_save_param_by_index(current_param_idx);
                         mark_param_pending_if_synced_to_mi(current_param_idx);
                     }
@@ -1592,10 +1619,25 @@ static void finish_prewet_now(void) {
 static void finish_dryrun_now(bool immediate_stop) {
     if (!dryrun_active) return;
     dryrun_active = false;
+    dryrun_restart_pending = false;
     dryrun_end_us = 0;
+
+    if (params[IDX_P33].value == 1 && (motor_running || output_frequency > 0.1f)) {
+        motor_running = false;
+        system_on = false;
+        dryrun_exit_restore_pending = true;
+        pulse_buttons(BTN_BIT_STOP);
+        current_state = (output_frequency > 0.1f) ? STATE_RUN : STATE_READY;
+        update_display_logic();
+        update_leds();
+        ESP_LOGW(TAG, "Secagem P31: aguardando motor parar para restaurar o sentido.");
+        return;
+    }
 
     motor_running = false;
     system_on = false;
+    dryrun_exit_restore_pending = false;
+    g_direction = dryrun_restore_direction;
     if (params[IDX_P12].value == 1) {
         saved_frequency = clamp_i(saved_target_before_stop, params[IDX_P20].value, params[IDX_P21].value);
         nvs_save_saved_frequency();
@@ -1628,12 +1670,94 @@ static void force_finish_all_timed_cycles(void) {
 static void phase_service(void) {
     int64_t now = esp_timer_get_time();
 
-    if (prewet_active && prewet_end_us > 0 && now >= prewet_end_us) {
-        finish_prewet_now();
+    if (prewet_active) {
+        if (water_shortage) {
+            ESP_LOGW(TAG, "P30 interrompido por falta de água: ligando motor imediatamente.");
+            finish_prewet_now();
+        } else if (prewet_end_us > 0 && now >= prewet_end_us) {
+            finish_prewet_now();
+        }
+    }
+
+    if (dryrun_restart_pending && output_frequency <= 0.1f) {
+        dryrun_restart_pending = false;
+        g_direction = dryrun_pending_direction;
+        motor_running = true;
+        system_on = true;
+        current_state = STATE_RUN;
+        pulse_buttons(BTN_BIT_START);
+        update_display_logic();
+        update_leds();
+        ESP_LOGW(TAG, "Secagem P31: motor religado em sentido invertido.");
+        return;
+    }
+
+    if (dryrun_exit_restore_pending && output_frequency <= 0.1f) {
+        dryrun_exit_restore_pending = false;
+        g_direction = dryrun_restore_direction;
+        if (params[IDX_P12].value == 1) {
+            saved_frequency = clamp_i(saved_target_before_stop, params[IDX_P20].value, params[IDX_P21].value);
+            nvs_save_saved_frequency();
+        }
+        current_state = STATE_READY;
+        update_display_logic();
+        update_leds();
+        ESP_LOGW(TAG, "Secagem P31: sentido restaurado com o motor parado.");
+        return;
     }
 
     if (dryrun_active && dryrun_end_us > 0 && now >= dryrun_end_us) {
         finish_dryrun_now(false);
+    }
+
+    exaustao_service();
+}
+
+static void exaustao_service(void) {
+    int64_t now = esp_timer_get_time();
+
+    if (current_state == STATE_ERROR) return;
+
+    if (exaustao_restart_pending && output_frequency <= 0.1f) {
+        exaustao_restart_pending = false;
+        g_direction = exaustao_pending_direction;
+        motor_running = true;
+        system_on = true;
+        current_state = STATE_RUN;
+        pulse_buttons(BTN_BIT_START);
+        if (params[IDX_P86].value > 0) {
+            exaustao_end_us = now + ((int64_t)params[IDX_P86].value * 60LL * 1000000LL);
+        } else {
+            exaustao_end_us = 0;
+        }
+        update_display_logic();
+        update_leds();
+        ESP_LOGW(TAG, "Exaustão: motor religado em sentido invertido.");
+        return;
+    }
+
+    if (exaustao_on && !exaustao_restart_pending && !exaustao_exit_pending && exaustao_end_us > 0 && now >= exaustao_end_us) {
+        ESP_LOGW(TAG, "Tempo de exaustão P86 concluído.");
+        request_exaustao_stop();
+        return;
+    }
+
+    if (exaustao_exit_pending && output_frequency <= 0.1f) {
+        exaustao_exit_pending = false;
+        exaustao_on = false;
+        exaustao_end_us = 0;
+        bomba_on = false;
+        swing_on = false;
+        g_direction = (uint8_t)params[IDX_P51].value;
+        target_frequency = clamp_i(exaustao_saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
+        motor_running = false;
+        system_on = false;
+        current_state = STATE_READY;
+        saved_resume_exaustao_on = false;
+        exaustao_pending_direction = (uint8_t)params[IDX_P51].value;
+        update_display_logic();
+        update_leds();
+        ESP_LOGW(TAG, "Exaustão finalizada: sistema voltou para pronto.");
     }
 }
 
@@ -1644,11 +1768,17 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
         swing_on = saved_resume_swing_on;
         exaustao_on = saved_resume_exaustao_on;
         saved_bomba_on = saved_resume_bomba_on;
+        g_direction = exaustao_on ? (uint8_t)(params[IDX_P51].value ? 0 : 1) : (uint8_t)params[IDX_P51].value;
         normalize_local_modes_by_params();
         target_frequency = (params[IDX_P12].value == 1) ? saved_frequency : params[IDX_P20].value;
 
         dryrun_active = false;
+        dryrun_restart_pending = false;
+        dryrun_exit_restore_pending = false;
+        dryrun_restore_direction = g_direction;
+        dryrun_pending_direction = g_direction;
         dryrun_end_us = 0;
+        exaustao_end_us = 0;
 
         if (!skip_timers && bomba_on && !exaustao_on && params[IDX_P30].value > 0) {
             prewet_active = true;
@@ -1664,6 +1794,7 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
         }
     } else {
         saved_resume_bomba_on = exaustao_on ? saved_bomba_on : bomba_on;
+        exaustao_end_us = 0;
         saved_resume_swing_on = swing_on;
         saved_resume_exaustao_on = exaustao_on;
         saved_target_before_stop = clamp_i(target_frequency, params[IDX_P20].value, params[IDX_P21].value);
@@ -1672,6 +1803,10 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
             prewet_active = false;
             prewet_end_us = 0;
             dryrun_active = true;
+            dryrun_restart_pending = false;
+            dryrun_exit_restore_pending = false;
+            dryrun_restore_direction = g_direction;
+            dryrun_pending_direction = (uint8_t)(g_direction ? 0 : 1);
             dryrun_end_us = esp_timer_get_time() + ((int64_t)params[IDX_P31].value * 60LL * 1000000LL);
             bomba_on = false;
             current_state = STATE_RUN;
@@ -1682,10 +1817,19 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
             } else {
                 target_frequency = clamp_i(params[IDX_P32].value, params[IDX_P20].value, params[IDX_P21].value);
             }
+            if (params[IDX_P33].value == 1) {
+                motor_running = false;
+                system_on = true;
+                dryrun_restart_pending = true;
+                pulse_buttons(BTN_BIT_STOP);
+                ESP_LOGW(TAG, "Secagem P31: parando motor para inverter o sentido.");
+            }
         } else {
             prewet_active = false;
             prewet_end_us = 0;
             dryrun_active = false;
+            dryrun_restart_pending = false;
+            dryrun_exit_restore_pending = false;
             dryrun_end_us = 0;
             motor_running = false;
             system_on = false;
@@ -1709,6 +1853,36 @@ static void handle_dreno_led(void) {
     }
 }
 
+static void request_exaustao_stop(void) {
+    int held_freq = (output_frequency > 0.1f) ? (int)(output_frequency + 0.5f) : target_frequency;
+    held_freq = clamp_i(held_freq, params[IDX_P20].value, params[IDX_P21].value);
+
+    exaustao_saved_frequency = held_freq;
+    exaustao_restart_pending = false;
+    exaustao_end_us = 0;
+
+    if (motor_running || output_frequency > 0.1f) {
+        motor_running = false;
+        system_on = true;
+        current_state = STATE_RUN;
+        exaustao_exit_pending = true;
+        pulse_buttons(BTN_BIT_STOP);
+        ESP_LOGW(TAG, "Saindo da exaustão: parando motor para voltar ao pronto.");
+    } else {
+        exaustao_exit_pending = false;
+        exaustao_on = false;
+        g_direction = (uint8_t)params[IDX_P51].value;
+        motor_running = false;
+        system_on = false;
+        current_state = STATE_READY;
+        saved_resume_exaustao_on = false;
+        exaustao_pending_direction = (uint8_t)params[IDX_P51].value;
+        ESP_LOGW(TAG, "Saindo da exaustão: sistema voltou ao pronto.");
+    }
+    update_display_logic();
+    update_leds();
+}
+
 static void handle_dreno_end(void) {
     if (dreno_status == DRENO_EM_CURSO || dreno_status == DRENO_AGUARDANDO_LED || dreno_post_wait_active) {
         /* Preserve the peripheral state that existed before dreno started.
@@ -1729,7 +1903,12 @@ static void handle_dreno_end(void) {
         prewet_active = false;
         prewet_end_us = 0;
         dryrun_active = false;
+        dryrun_restart_pending = false;
+        dryrun_exit_restore_pending = false;
+        dryrun_restore_direction = g_direction;
+        dryrun_pending_direction = g_direction;
         dryrun_end_us = 0;
+        exaustao_end_us = 0;
         set_motor_running_ex(false, true);
 
         saved_resume_bomba_on = resume_bomba;
@@ -1779,6 +1958,11 @@ static void handle_button_event(button_id_t id, bool long_press) {
         ESP_LOGW(TAG, "Apagando NVS e reiniciando...");
         nvs_flash_erase();
         esp_restart();
+        return;
+    }
+
+    if ((exaustao_on || exaustao_restart_pending || exaustao_exit_pending) && id != BTN_EXAUSTAO && id != BTN_MAIS && id != BTN_MENOS) {
+        ESP_LOGW(TAG, "Comando bloqueado: durante a exaustão, somente EXAUSTAO e ajuste de frequência podem atuar.");
         return;
     }
 
@@ -1855,7 +2039,7 @@ static void handle_button_event(button_id_t id, bool long_press) {
         return;
     }
 
-    if (!system_on && id != BTN_DRENO) {
+    if (!system_on && id != BTN_DRENO && id != BTN_EXAUSTAO) {
         ESP_LOGW(TAG, "Comando ignorado: sistema desligado.");
         return;
     }
@@ -1870,7 +2054,6 @@ static void handle_button_event(button_id_t id, bool long_press) {
 
     switch (id) {
         case BTN_CLIMATIZAR:
-            if (exaustao_on) exaustao_on = false;
             if (params[IDX_P82].value == 0 || params[IDX_P85].value == 0) {
                 bomba_on = false;
                 ESP_LOGW(TAG, "Climatizar indisponível: P82=0 ou P85=0.");
@@ -1879,7 +2062,6 @@ static void handle_button_event(button_id_t id, bool long_press) {
             }
             break;
         case BTN_VENTILAR:
-            if (exaustao_on) exaustao_on = false;
             bomba_on = false;
             break;
         case BTN_SWING:
@@ -1892,16 +2074,52 @@ static void handle_button_event(button_id_t id, bool long_press) {
                 swing_on = !swing_on;
             }
             break;
-        case BTN_EXAUSTAO:
-            if (!exaustao_on) {
+        case BTN_EXAUSTAO: {
+            int held_freq = (output_frequency > 0.1f) ? (int)(output_frequency + 0.5f) : ((target_frequency > 0) ? target_frequency : saved_frequency);
+            held_freq = clamp_i(held_freq, params[IDX_P20].value, params[IDX_P21].value);
+
+            if (!exaustao_on && !exaustao_restart_pending && !exaustao_exit_pending) {
+                if (params[IDX_P86].value == 0) {
+                    ESP_LOGW(TAG, "Exaustão desabilitada por P86=0.");
+                    break;
+                }
+
+                saved_resume_bomba_on = bomba_on;
+                saved_resume_swing_on = swing_on;
+                saved_resume_exaustao_on = false;
                 saved_bomba_on = bomba_on;
+                saved_exaustao_swing_on = swing_on;
+                exaustao_saved_frequency = held_freq;
+
                 exaustao_on = true;
                 bomba_on = false;
+                swing_on = false;
+                target_frequency = exaustao_saved_frequency;
+                exaustao_pending_direction = (uint8_t)(params[IDX_P51].value ? 0 : 1);
+
+                if (motor_running || output_frequency > 0.1f) {
+                    motor_running = false;
+                    system_on = true;
+                    current_state = STATE_RUN;
+                    exaustao_restart_pending = true;
+                    exaustao_end_us = 0;
+                    pulse_buttons(BTN_BIT_STOP);
+                    ESP_LOGW(TAG, "Exaustão iniciada: parando motor para reiniciar em sentido invertido.");
+                } else {
+                    g_direction = exaustao_pending_direction;
+                    motor_running = true;
+                    system_on = true;
+                    current_state = STATE_RUN;
+                    exaustao_restart_pending = false;
+                    exaustao_end_us = esp_timer_get_time() + ((int64_t)params[IDX_P86].value * 60LL * 1000000LL);
+                    pulse_buttons(BTN_BIT_START);
+                    ESP_LOGW(TAG, "Exaustão iniciada: motor ligado em sentido invertido.");
+                }
             } else {
-                exaustao_on = false;
-                bomba_on = saved_bomba_on;
+                request_exaustao_stop();
             }
             break;
+        }
         case BTN_DRENO: {
             int mode = params[IDX_P80].value;
             if (mode == 0) {
@@ -2011,7 +2229,10 @@ static void process_console_command(char *cmd) {
     if (strcasecmp(cmd, "SIMWL0") == 0) { sim_wl = false; wifi_lost = false; update_display_logic(); return; }
 
     if (strncasecmp(cmd, "DIR=", 4) == 0) {
-        g_direction = (uint8_t)atoi(cmd + 4);
+        g_direction = (uint8_t)(atoi(cmd + 4) ? 1 : 0);
+        params[IDX_P51].value = g_direction;
+        nvs_save_param_by_index(IDX_P51);
+        mark_param_pending_if_synced_to_mi(IDX_P51);
         printf("\n[DIR] %s\n", g_direction ? "REV" : "FWD");
         return;
     }
@@ -2178,10 +2399,15 @@ void app_main(void) {
     current_error_code = 0;
     system_on = false;
     motor_running = false;
-    target_frequency = clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
+    g_direction = (uint8_t)params[IDX_P51].value;
+    bomba_on = (params[IDX_P82].value != 0 && params[IDX_P85].value != 0);
+    saved_bomba_on = bomba_on;
     saved_resume_bomba_on = bomba_on;
     saved_resume_swing_on = swing_on;
     saved_resume_exaustao_on = exaustao_on;
+    exaustao_restart_pending = false;
+    exaustao_exit_pending = false;
+    target_frequency = clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
     output_frequency = 0.0f;
     prewet_active = false;
     dryrun_active = false;
