@@ -1510,6 +1510,30 @@ static void apply_menu_enter_or_confirm(void) {
                 target_frequency = params[IDX_P20].value;
                 is_locked = true;
                 enforce_param_coherence();
+
+                /* Factory reset must restore the default startup mode:
+                 * CLIMATIZAR enabled for the next start, with swing/exaustao off.
+                 */
+                system_on = false;
+                motor_running = false;
+                bomba_on = (params[IDX_P82].value != 0 && params[IDX_P85].value != 0);
+                swing_on = false;
+                exaustao_on = false;
+                saved_bomba_on = bomba_on;
+                saved_resume_bomba_on = bomba_on;
+                saved_resume_swing_on = false;
+                saved_resume_exaustao_on = false;
+                prewet_active = false;
+                dryrun_active = false;
+                dreno_status = DRENO_IDLE;
+                dreno_post_wait_active = false;
+                exaustao_restart_pending = false;
+                exaustao_exit_pending = false;
+                current_state = STATE_READY;
+                g_direction = (uint8_t)params[IDX_P51].value;
+                update_leds();
+                update_display_logic();
+
                 for (int i = 0; i < PARAM_COUNT; i++) {
                     if (!params[i].read_only) nvs_save_param_by_index(i);
                     if (is_mi_synced_index(i)) params[i].pending_sync = true;
@@ -1749,7 +1773,9 @@ static void exaustao_service(void) {
         bomba_on = false;
         swing_on = false;
         g_direction = (uint8_t)params[IDX_P51].value;
-        target_frequency = clamp_i(exaustao_saved_frequency, params[IDX_P20].value, params[IDX_P21].value);
+        target_frequency = (params[IDX_P12].value == 1)
+            ? clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value)
+            : params[IDX_P20].value;
         motor_running = false;
         system_on = false;
         current_state = STATE_READY;
@@ -1845,14 +1871,6 @@ static void set_motor_running_ex(bool run, bool skip_timers) {
     update_leds();
 }
 
-static void handle_dreno_led(void) {
-    if (dreno_status == DRENO_AGUARDANDO_LED) {
-        dreno_status = DRENO_EM_CURSO;
-        ESP_LOGW(TAG, "MI confirmou início do dreno.");
-        update_leds();
-    }
-}
-
 static void request_exaustao_stop(void) {
     int held_freq = (output_frequency > 0.1f) ? (int)(output_frequency + 0.5f) : target_frequency;
     held_freq = clamp_i(held_freq, params[IDX_P20].value, params[IDX_P21].value);
@@ -1872,6 +1890,9 @@ static void request_exaustao_stop(void) {
         exaustao_exit_pending = false;
         exaustao_on = false;
         g_direction = (uint8_t)params[IDX_P51].value;
+        target_frequency = (params[IDX_P12].value == 1)
+            ? clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value)
+            : params[IDX_P20].value;
         motor_running = false;
         system_on = false;
         current_state = STATE_READY;
@@ -1967,6 +1988,21 @@ static void handle_button_event(button_id_t id, bool long_press) {
     }
 
     if (id == BTN_SET) {
+        bool base_set_allowed = (!prewet_active && !dryrun_active &&
+                                 dreno_status == DRENO_IDLE && !dreno_post_wait_active &&
+                                 !exaustao_on && !exaustao_restart_pending && !exaustao_exit_pending);
+
+        bool state_set_allowed = ((current_state == STATE_READY && !motor_running && output_frequency <= 0.1f) ||
+                                  (current_state == STATE_RUN && motor_running) ||
+                                  current_state == STATE_MENU_SEL ||
+                                  current_state == STATE_MENU_EDIT);
+
+        bool set_allowed = base_set_allowed && state_set_allowed;
+
+        if (!set_allowed) {
+            ESP_LOGW(TAG, "SET bloqueado: menu só pode ser acessado em rdy, em funcionamento normal, ou durante a própria edição do menu.");
+            return;
+        }
         if (long_press) apply_menu_back();
         else apply_menu_enter_or_confirm();
         update_display_logic();
@@ -1974,11 +2010,19 @@ static void handle_button_event(button_id_t id, bool long_press) {
     }
 
     if (id == BTN_MAIS) {
+        if (dryrun_active) {
+            ESP_LOGW(TAG, "Comando bloqueado: durante o tempo de secagem P31, a frequencia nao pode ser alterada.");
+            return;
+        }
         change_menu_or_frequency(+1);
         update_display_logic();
         return;
     }
     if (id == BTN_MENOS) {
+        if (dryrun_active) {
+            ESP_LOGW(TAG, "Comando bloqueado: durante o tempo de secagem P31, a frequencia nao pode ser alterada.");
+            return;
+        }
         change_menu_or_frequency(-1);
         update_display_logic();
         return;
@@ -2075,7 +2119,12 @@ static void handle_button_event(button_id_t id, bool long_press) {
             }
             break;
         case BTN_EXAUSTAO: {
-            int held_freq = (output_frequency > 0.1f) ? (int)(output_frequency + 0.5f) : ((target_frequency > 0) ? target_frequency : saved_frequency);
+            int normal_ready_freq = (params[IDX_P12].value == 1)
+                ? clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value)
+                : params[IDX_P20].value;
+            int held_freq = (output_frequency > 0.1f)
+                ? (int)(output_frequency + 0.5f)
+                : ((motor_running || system_on) ? target_frequency : normal_ready_freq);
             held_freq = clamp_i(held_freq, params[IDX_P20].value, params[IDX_P21].value);
 
             if (!exaustao_on && !exaustao_restart_pending && !exaustao_exit_pending) {
@@ -2084,10 +2133,19 @@ static void handle_button_event(button_id_t id, bool long_press) {
                     break;
                 }
 
-                saved_resume_bomba_on = bomba_on;
-                saved_resume_swing_on = swing_on;
-                saved_resume_exaustao_on = false;
-                saved_bomba_on = bomba_on;
+                /* Save a resume snapshot only from NORMAL operation.
+                 * If EXAUSTAO is triggered again from READY right after a prior exaustao cycle,
+                 * keep the last normal snapshot instead of overwriting it with the exaustao snapshot. */
+                if (motor_running || system_on || prewet_active || dryrun_active) {
+                    saved_resume_bomba_on = bomba_on;
+                    saved_resume_swing_on = swing_on;
+                    saved_resume_exaustao_on = false;
+                    saved_bomba_on = bomba_on;
+                    if (params[IDX_P12].value == 1) {
+                        saved_frequency = held_freq;
+                        nvs_save_saved_frequency();
+                    }
+                }
                 saved_exaustao_swing_on = swing_on;
                 exaustao_saved_frequency = held_freq;
 
@@ -2146,10 +2204,28 @@ static void handle_button_event(button_id_t id, bool long_press) {
                 return;
             }
 
-            saved_resume_bomba_on = bomba_on;
-            saved_resume_swing_on = swing_on;
-            saved_resume_exaustao_on = exaustao_on;
-            saved_bomba_on = bomba_on;
+            /* Save a resume snapshot only from NORMAL operation.
+             * If DRENO is triggered again from READY right after a prior dreno cycle,
+             * keep the last normal snapshot instead of overwriting it with the dreno snapshot.
+             */
+            int normal_ready_freq = (params[IDX_P12].value == 1)
+                ? clamp_i(saved_frequency, params[IDX_P20].value, params[IDX_P21].value)
+                : params[IDX_P20].value;
+            int held_freq = (output_frequency > 0.1f)
+                ? (int)(output_frequency + 0.5f)
+                : ((motor_running || system_on || prewet_active || dryrun_active) ? target_frequency : normal_ready_freq);
+            held_freq = clamp_i(held_freq, params[IDX_P20].value, params[IDX_P21].value);
+
+            if (motor_running || system_on || prewet_active || dryrun_active) {
+                saved_resume_bomba_on = bomba_on;
+                saved_resume_swing_on = swing_on;
+                saved_resume_exaustao_on = exaustao_on;
+                saved_bomba_on = bomba_on;
+                if (params[IDX_P12].value == 1) {
+                    saved_frequency = held_freq;
+                    nvs_save_saved_frequency();
+                }
+            }
             bomba_on = false;
             swing_on = false;
             exaustao_on = false;
@@ -2194,12 +2270,7 @@ static void print_help(void) {
     printf("SWING           -> toggle swing\n");
     printf("EXAUSTAO        -> toggle exaustão\n");
     printf("DRENO           -> aciona dreno conforme P80\n");
-    printf("DL              -> simula confirmação de início do dreno pelo MI\n");
-    printf("DF              -> simula fim do dreno pelo MI\n");
-    printf("DIR=0|1         -> sentido FWD/REV\n");
-    printf("Pxx=valor       -> escreve parâmetro\n");
     printf("MON / SIL       -> logs on/off\n");
-    printf("SIMWS1/0        -> simula falta de água\n");
     printf("SIMWL1/0        -> simula perda Wi-Fi\n");
     printf("RESETWIFI       -> apaga NVS e reinicia\n");
     printf("HELP            -> mostra ajuda\n");
@@ -2223,49 +2294,14 @@ static void process_console_command(char *cmd) {
         printf("\n[LOGS OFF]\n");
         return;
     }
-    if (strcasecmp(cmd, "SIMWS1") == 0) { sim_ws = true;  water_shortage = true; update_display_logic(); return; }
-    if (strcasecmp(cmd, "SIMWS0") == 0) { sim_ws = false; water_shortage = ((g_telemetry.status_flags & MI_STATUS_WATER_SHORTAGE) != 0u); update_display_logic(); return; }
     if (strcasecmp(cmd, "SIMWL1") == 0) { sim_wl = true;  wifi_lost = true; update_display_logic(); return; }
     if (strcasecmp(cmd, "SIMWL0") == 0) { sim_wl = false; wifi_lost = false; update_display_logic(); return; }
-
-    if (strncasecmp(cmd, "DIR=", 4) == 0) {
-        g_direction = (uint8_t)(atoi(cmd + 4) ? 1 : 0);
-        params[IDX_P51].value = g_direction;
-        nvs_save_param_by_index(IDX_P51);
-        mark_param_pending_if_synced_to_mi(IDX_P51);
-        printf("\n[DIR] %s\n", g_direction ? "REV" : "FWD");
-        return;
-    }
-
-    if (strncasecmp(cmd, "P", 1) == 0) {
-        unsigned id = 0;
-        int value = 0;
-        if (sscanf(cmd, "P%u=%d", &id, &value) == 2) {
-            for (int i = 0; i < PARAM_COUNT; i++) {
-                if ((unsigned)params[i].id == id) {
-                    if (params[i].read_only) {
-                        printf("\n[P%02u] somente leitura\n", id);
-                        return;
-                    }
-                    params[i].value = clamp_i(value, params[i].min_val, params[i].max_val);
-                    enforce_param_coherence();
-                    nvs_save_param_by_index(i);
-                    mark_param_pending_if_synced_to_mi(i);
-                    printf("\n[P%02u] = %d\n", id, params[i].value);
-                    update_display_logic();
-                    return;
-                }
-            }
-            printf("\n[P%02u] não encontrado\n", id);
-            return;
-        }
-    }
 
     if (strcasecmp(cmd, "ONOFFL") == 0) {
         handle_button_event(BTN_ONOFF, true);
         return;
     }
-    if (strcasecmp(cmd, "ONOFF") == 0 || strcasecmp(cmd, "POWER") == 0 || strcasecmp(cmd, "S") == 0) {
+    if (strcasecmp(cmd, "ONOFF") == 0 || strcasecmp(cmd, "POWER") == 0) {
         handle_button_event(BTN_ONOFF, false);
         return;
     }
@@ -2277,7 +2313,7 @@ static void process_console_command(char *cmd) {
         handle_button_event(BTN_MENOS, false);
         return;
     }
-    if (strcasecmp(cmd, "SET") == 0 || strcasecmp(cmd, "E") == 0) {
+    if (strcasecmp(cmd, "SET") == 0) {
         handle_button_event(BTN_SET, false);
         return;
     }
@@ -2303,14 +2339,6 @@ static void process_console_command(char *cmd) {
     }
     if (strcasecmp(cmd, "DRENO") == 0) {
         handle_button_event(BTN_DRENO, false);
-        return;
-    }
-    if (strcasecmp(cmd, "DL") == 0 || strcasecmp(cmd, "DRENO_LED") == 0) {
-        handle_dreno_led();
-        return;
-    }
-    if (strcasecmp(cmd, "DF") == 0 || strcasecmp(cmd, "DRENO_FIM") == 0) {
-        handle_dreno_end();
         return;
     }
     if (strcasecmp(cmd, "RESETWIFI") == 0) {
