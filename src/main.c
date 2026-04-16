@@ -722,6 +722,7 @@ static void update_display_logic(void) {
 
         case STATE_MENU_EDIT: {
             int p_id = params[current_param_idx].id;
+
             if (p_id == 6) {
                 int e = (int)err_hist_get_by_offset(err_view_offset);
                 display_buffer[0] = get_char_pattern('E');
@@ -729,7 +730,13 @@ static void update_display_logic(void) {
                 display_buffer[2] = get_char_pattern(e % 10 + '0');
                 return;
             }
-            val = temp_edit_value;
+
+            /* Parâmetros somente leitura devem aparecer dinâmicos. */
+            if (params[current_param_idx].read_only) {
+                val = params[current_param_idx].value;
+            } else {
+                val = temp_edit_value;
+            }
         } break;
 
         case STATE_ERROR:
@@ -1290,8 +1297,20 @@ static void status_watchdog_task(void *arg) {
     int64_t last_loop_us = esp_timer_get_time();
     int64_t boot_us = last_loop_us;
     uint32_t last_rx_total = 0;
-    float loss_ema = 0.0f;
-    const float alpha = 0.20f;
+
+    /* P90 has two layers:
+     * - raw_loss_ema: fast estimate used by the E08 logic
+     * - display_loss_ema: slower estimate shown in the menu
+     *
+     * The display filter is intentionally close to a ~3 s horizon, which matches
+     * COMM_FAULT_HOLD_MS. This makes P90 more visually stable while keeping the
+     * same units as P91 (% loss). In practice, if the displayed P90 stays above
+     * P91 for a while, that now correlates much better with an upcoming E08.
+     */
+    float raw_loss_ema = 0.0f;
+    float display_loss_ema = 0.0f;
+    const float alpha_raw = 0.20f;
+    const float alpha_display = 0.06f; /* ~3 s smoothing at WD_CHECK_MS=100 ms */
     int fault_hold_ms = 0;
     int stable_ms = 0;
 
@@ -1323,7 +1342,7 @@ static void status_watchdog_task(void *arg) {
 
         bool timed_out = (last_rx_us_local == 0) || ((now - last_rx_us_local) > (int64_t)STATUS_TIMEOUT_MS * 1000LL);
 
-        float inst_loss = loss_ema;
+        float inst_loss = raw_loss_ema;
         if (expected_pkts > 0) {
             float r = (float)rx_delta / (float)expected_pkts;
             if (r > 1.0f) r = 1.0f;
@@ -1332,13 +1351,16 @@ static void status_watchdog_task(void *arg) {
         }
 
         if (good_pulse && !timed_out) {
-            loss_ema *= 0.5f;
+            raw_loss_ema *= 0.5f;
         }
-        loss_ema = (1.0f - alpha) * loss_ema + alpha * inst_loss;
+        raw_loss_ema = (1.0f - alpha_raw) * raw_loss_ema + alpha_raw * inst_loss;
+        display_loss_ema = (1.0f - alpha_display) * display_loss_ema + alpha_display * raw_loss_ema;
 
-        params[IDX_P90].value = clamp_i((int)(loss_ema * 100.0f + 0.5f), 0, 100);
+        int p90_raw = clamp_i((int)(raw_loss_ema * 100.0f + 0.5f), 0, 100);
+        int p90_display = clamp_i((int)(display_loss_ema * 100.0f + 0.5f), 0, 100);
+        params[IDX_P90].value = p90_display;
 
-        bool comm_bad = timed_out || (params[IDX_P90].value > params[IDX_P91].value);
+        bool comm_bad = timed_out || (p90_raw > params[IDX_P91].value);
 
         if (in_grace) {
             fault_hold_ms = 0;
